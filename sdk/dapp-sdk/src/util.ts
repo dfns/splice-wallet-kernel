@@ -7,8 +7,6 @@ import { removeKernelDiscovery, removeKernelSession } from './storage'
 export const clearAllLocalState = ({
     closePopup,
 }: { closePopup?: boolean } = {}) => {
-    //window.canton = undefined // Clear global canton provider
-
     removeKernelSession()
     removeKernelDiscovery()
     if (closePopup) {

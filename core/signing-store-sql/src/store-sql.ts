@@ -98,21 +98,6 @@ export class StoreSql implements SigningDriverStore, AuthAware<StoreSql> {
     async setSigningKey(userId: string, key: SigningKey): Promise<void> {
         const serialized = fromSigningKey(key, userId)
 
-        console.log(
-            'setSigningKey - serialized data:',
-            JSON.stringify(serialized, null, 2)
-        )
-        console.log('setSigningKey - serialized types:', {
-            id: typeof serialized.id,
-            userId: typeof serialized.userId,
-            name: typeof serialized.name,
-            publicKey: typeof serialized.publicKey,
-            privateKey: typeof serialized.privateKey,
-            metadata: typeof serialized.metadata,
-            createdAt: typeof serialized.createdAt,
-            updatedAt: typeof serialized.updatedAt,
-        })
-
         await this.db
             .insertInto('signingKeys')
             .values(serialized)
@@ -342,11 +327,18 @@ export class StoreSql implements SigningDriverStore, AuthAware<StoreSql> {
 }
 
 export const connection = (config: StoreConfig) => {
+    let database
     switch (config.connection.type) {
         case 'sqlite':
+            database = new Database(config.connection.database)
+            // normally sqlite3 has foreign_keys = OFF for each connection,
+            // but better-sqlite3 uses custom build with compile flag SQLITE_DEFAULT_FOREIGN_KEYS=1,
+            // making it ON by default.
+            // Set explicitly ON anyway as redundancy
+            database.pragma('foreign_keys = ON')
             return new Kysely<DB>({
                 dialect: new SqliteDialect({
-                    database: new Database(config.connection.database),
+                    database,
                 }),
                 plugins: [new CamelCasePlugin()],
             })
@@ -364,9 +356,11 @@ export const connection = (config: StoreConfig) => {
                 plugins: [new CamelCasePlugin()],
             })
         case 'memory':
+            database = new Database(':memory:')
+            database.pragma('foreign_keys = ON')
             return new Kysely<DB>({
                 dialect: new SqliteDialect({
-                    database: new Database(':memory:'),
+                    database,
                 }),
                 plugins: [new CamelCasePlugin()],
             })

@@ -19,25 +19,23 @@ import {
     AddIdpParams,
     RemoveIdpParams,
     CreateWalletParams,
+    AllocatePartyForWalletParams,
     GetTransactionResult,
     GetTransactionParams,
+    DeleteTransactionParams,
     Null,
     ListTransactionsResult,
+    GetUserResult,
 } from './rpc-gen/typings.js'
-import {
-    Store,
-    Transaction,
-    Network,
-    Wallet,
-} from '@canton-network/core-wallet-store'
+import { Store, Network } from '@canton-network/core-wallet-store'
 import { Logger } from 'pino'
 import { NotificationService } from '../notification/NotificationService.js'
 import {
-    AccessTokenProvider,
     assertConnected,
     AuthContext,
     authSchema,
     AuthTokenProvider,
+    fetchOidcUserInfo,
     idpSchema,
 } from '@canton-network/core-wallet-auth'
 import { KernelInfo } from '../config/Config.js'
@@ -45,18 +43,13 @@ import {
     SigningDriverInterface,
     SigningProvider,
 } from '@canton-network/core-signing-lib'
-import {
-    AllocatedParty,
-    PartyAllocationService,
-} from '../ledger/party-allocation-service.js'
+import { PartyAllocationService } from '../ledger/party-allocation-service.js'
+import { WalletAllocationService } from '../ledger/wallet-allocation/wallet-allocation-service.js'
 import { WalletSyncService } from '../ledger/wallet-sync-service.js'
-import {
-    networkStatus,
-    type PrepareParams,
-    ledgerPrepareParams,
-} from '../utils.js'
-import { StatusEvent } from '../dapp-api/rpc-gen/typings.js'
+import { networkStatus } from '../utils.js'
 import { v4 } from 'uuid'
+import { TransactionService } from '../ledger/transaction-service.js'
+import { StatusEvent } from '../dapp-api/rpc-gen/typings.js'
 
 type AvailableSigningDrivers = Partial<
     Record<SigningProvider, SigningDriverInterface>
@@ -69,12 +62,68 @@ export const userController = (
     notificationService: NotificationService,
     authContext: AuthContext | undefined,
     drivers: AvailableSigningDrivers,
-    _logger: Logger
+    _logger: Logger,
+    adminUserId?: string
 ) => {
     const logger = _logger.child({ component: 'user-controller' })
+    const provider = {
+        id: kernelInfo.id,
+        version: 'TODO',
+        providerType: kernelInfo.clientType,
+        userUrl: `${userUrl}/login/`,
+    }
+
+    function assertAdmin(): void {
+        const userId = assertConnected(authContext).userId
+        if (!adminUserId || userId !== adminUserId) {
+            throw new Error(
+                'Unauthorized: only the admin user can perform this operation'
+            )
+        }
+    }
+
+    async function resolveUserEmail(
+        connectedContext: AuthContext
+    ): Promise<string | undefined> {
+        if (connectedContext.email) {
+            return connectedContext.email
+        }
+
+        try {
+            const network = await store.getCurrentNetwork()
+            if (!network) {
+                return undefined
+            }
+
+            const idp = await store.getIdp(network.identityProviderId)
+            if (idp.type !== 'oauth') {
+                return undefined
+            }
+
+            const userInfo = await fetchOidcUserInfo(
+                idp.configUrl,
+                connectedContext.accessToken
+            )
+            return userInfo?.email
+        } catch (error) {
+            logger.warn(
+                error,
+                'Failed to resolve user email from OIDC userinfo'
+            )
+            return undefined
+        }
+    }
 
     return buildController({
+        getUser: async (): Promise<GetUserResult> => {
+            const userId = assertConnected(authContext).userId
+            return {
+                userId,
+                isAdmin: !!adminUserId && userId === adminUserId,
+            }
+        },
         addNetwork: async (params: AddNetworkParams) => {
+            assertAdmin()
             const { network } = params
 
             const ledgerApi = {
@@ -100,50 +149,63 @@ export const userController = (
             // TODO: Add an explicit updateNetwork method to the User API spec and controller
             const existingNetworks = await store.listNetworks()
             if (existingNetworks.find((n) => n.id === newNetwork.id)) {
+                logger.info(`Updating network ${newNetwork.id}`)
                 await store.updateNetwork(newNetwork)
             } else {
+                logger.info(`Adding network ${newNetwork.id}`)
                 await store.addNetwork(newNetwork)
             }
 
             return null
         },
         removeNetwork: async (params: RemoveNetworkParams) => {
+            assertAdmin()
             await store.removeNetwork(params.networkName)
             return null
         },
-        listNetworks: async () =>
-            Promise.resolve({ networks: await store.listNetworks() }),
+        listNetworks: async () => {
+            const networks = await store.listNetworks()
+            return {
+                networks: networks.map((n) => ({
+                    ...n,
+                    ledgerApi: n.ledgerApi.baseUrl,
+                })),
+            }
+        },
         addIdp: async (params: AddIdpParams) => {
+            assertAdmin()
             const validatedIdp = idpSchema.parse(params.idp)
 
             // TODO: Add an explicit updateIdp method to the User API spec and controller
             const existingIdps = await store.listIdps()
             if (existingIdps.find((n) => n.id === validatedIdp.id)) {
+                logger.info(`Updating IDP ${validatedIdp.id}`)
                 await store.updateIdp(validatedIdp)
             } else {
+                logger.info(`Adding IDP ${validatedIdp.id}`)
                 await store.addIdp(validatedIdp)
             }
 
             return null
         },
         removeIdp: async (params: RemoveIdpParams) => {
+            assertAdmin()
+            logger.info(`Removing IDP ${params.identityProviderId}`)
             await store.removeIdp(params.identityProviderId)
             return null
         },
         listIdps: async () => Promise.resolve({ idps: await store.listIdps() }),
         createWallet: async (params: CreateWalletParams) => {
             logger.info(
-                `Allocating party with params: ${JSON.stringify(params)}`
+                `Creating wallet with params: ${JSON.stringify(params)}`
             )
 
-            const {
-                signingProviderId,
-                signingProviderContext,
-                primary,
-                partyHint,
-            } = params
+            const { signingProviderId, primary, partyHint } = params
 
-            const userId = assertConnected(authContext).userId
+            const connectedContext = assertConnected(authContext)
+            const userId = connectedContext.userId
+            const email = await resolveUserEmail(connectedContext)
+
             const notifier = notificationService.getNotifier(userId)
             const network = await store.getCurrentNetwork()
 
@@ -153,303 +215,159 @@ export const userController = (
 
             const idp = await store.getIdp(network.identityProviderId)
 
-            const tokenProvider = new AuthTokenProvider(
+            if (!network.adminAuth) {
+                throw new Error('No admin auth configured')
+            }
+
+            const adminTokenProvider = AuthTokenProvider.fromGatewayConfig(
                 idp,
-                network.auth,
                 network.adminAuth,
                 logger
             )
+
             const partyAllocator = new PartyAllocationService({
                 synchronizerId: network.synchronizerId,
-                accessTokenProvider: tokenProvider,
+                accessTokenProvider: adminTokenProvider,
                 httpLedgerUrl: network.ledgerApi.baseUrl,
                 logger,
             })
-            const driver =
-                drivers[signingProviderId as SigningProvider]?.controller(
-                    userId
-                )
+            const walletAllocationService = new WalletAllocationService(
+                store,
+                logger,
+                partyAllocator,
+                drivers
+            )
 
-            if (!driver) {
+            if (!drivers[signingProviderId as SigningProvider]) {
                 throw new Error(
                     `Signing provider ${signingProviderId} not supported`
                 )
             }
 
-            let party: AllocatedParty
-            let publicKey: string | undefined
-            let txId: string = ''
-            let walletStatus: string = 'allocated'
-            let topologyTransactions: string[] = []
+            const wallet = await walletAllocationService.createWallet(
+                userId,
+                email,
+                partyHint,
+                primary ?? false,
+                signingProviderId as SigningProvider
+            )
 
-            switch (signingProviderId) {
-                case SigningProvider.PARTICIPANT: {
-                    party = await partyAllocator.allocateParty(
-                        userId,
-                        partyHint
-                    )
-                    break
-                }
-                case SigningProvider.WALLET_KERNEL: {
-                    const key = await driver.createKey({
-                        name: partyHint,
-                    })
+            // Sync wallets (TODO: separate rights sync from wallet sync as we only need rights sync here)
+            const ledgerClient = new LedgerClient({
+                baseUrl: new URL(network.ledgerApi.baseUrl),
+                logger,
+                accessTokenProvider: AuthTokenProvider.fromToken(
+                    authContext!.accessToken,
+                    logger
+                ),
+            })
+            const service = new WalletSyncService(
+                store,
+                ledgerClient,
+                authContext!,
+                logger,
+                drivers,
+                partyAllocator
+            )
+            await service.syncWallets()
 
-                    party = await partyAllocator.allocateParty(
-                        userId,
-                        partyHint,
-                        key.publicKey,
-                        async (hash) => {
-                            const { signature } = await driver.signTransaction({
-                                tx: '',
-                                txHash: hash,
-                                keyIdentifier: {
-                                    publicKey: key.publicKey,
-                                },
-                            })
-
-                            return signature
-                        }
-                    )
-                    publicKey = key.publicKey
-                    break
-                }
-                case SigningProvider.BLOCKDAEMON: {
-                    if (signingProviderContext?.externalTxId) {
-                        walletStatus = 'initialized'
-                        const { signature, status } =
-                            await driver.getTransaction({
-                                userId,
-                                txId: signingProviderContext.externalTxId,
-                            })
-
-                        if (!['pending', 'signed'].includes(status)) {
-                            await store.removeWallet(
-                                signingProviderContext.partyId
-                            )
-                        }
-
-                        if (signature) {
-                            await partyAllocator.allocatePartyWithExistingWallet(
-                                signingProviderContext.namespace,
-                                signingProviderContext.topologyTransactions.split(
-                                    ', '
-                                ),
-                                signature,
-                                userId
-                            )
-                            walletStatus = 'allocated'
-                        }
-                        party = {
-                            partyId: signingProviderContext.partyId,
-                            namespace: signingProviderContext.namespace,
-                            hint: partyHint,
-                        }
-                    } else {
-                        const key = await driver.createKey({
-                            name: partyHint,
-                        })
-                        if ('error' in key) {
-                            throw new Error(
-                                `Failed to create key: ${key.error_description}`
-                            )
-                        }
-
-                        const namespace =
-                            partyAllocator.createFingerprintFromKey(
-                                key.publicKey
-                            )
-
-                        const transactions =
-                            await partyAllocator.generateTopologyTransactions(
-                                partyHint,
-                                key.publicKey
-                            )
-                        topologyTransactions =
-                            transactions.topologyTransactions ?? []
-                        topologyTransactions.forEach((tx, idx) => {
-                            logger.info(
-                                `BLOCKDAEMON: topologyTransaction[${idx}] length=${tx.length} preview=${tx.substring(0, 100)}...`
-                            )
-                        })
-                        let partyId = ''
-
-                        const internalTxId = crypto
-                            .randomUUID()
-                            .replace(/-/g, '')
-                            .substring(0, 16)
-                        const txPayload = JSON.stringify(topologyTransactions)
-
-                        const { status, txId: id } =
-                            await driver.signTransaction({
-                                tx: Buffer.from(txPayload).toString('base64'),
-                                txHash: transactions.multiHash,
-                                keyIdentifier: {
-                                    publicKey: key.publicKey,
-                                },
-                                internalTxId,
-                            })
-
-                        if (status === 'signed') {
-                            const { signature } = await driver.getTransaction({
-                                userId,
-                                txId: id,
-                            })
-                            partyId =
-                                await partyAllocator.allocatePartyWithExistingWallet(
-                                    namespace,
-                                    transactions.topologyTransactions ?? [],
-                                    signature,
-                                    userId
-                                )
-                        } else {
-                            txId = id
-                            walletStatus = 'initialized'
-                        }
-
-                        party = {
-                            partyId,
-                            namespace,
-                            hint: partyHint,
-                        }
-                        publicKey = key.publicKey
-                    }
-                    break
-                }
-                case SigningProvider.FIREBLOCKS: {
-                    const keys = await driver.getKeys()
-                    const key = keys?.keys?.find(
-                        (k) => k.name === 'Canton Party'
-                    )
-                    if (!key) throw new Error('Fireblocks key not found')
-
-                    if (signingProviderContext) {
-                        walletStatus = 'initialized'
-                        const { signature, status } =
-                            await driver.getTransaction({
-                                userId,
-                                txId: signingProviderContext.externalTxId,
-                            })
-
-                        if (!['pending', 'signed'].includes(status)) {
-                            await store.removeWallet(
-                                signingProviderContext.partyId
-                            )
-                        }
-
-                        if (signature) {
-                            await partyAllocator.allocatePartyWithExistingWallet(
-                                signingProviderContext.namespace,
-                                signingProviderContext.topologyTransactions.split(
-                                    ', '
-                                ),
-                                Buffer.from(signature, 'hex').toString(
-                                    'base64'
-                                ),
-                                userId
-                            )
-                            walletStatus = 'allocated'
-                        }
-                        party = {
-                            partyId: signingProviderContext.partyId,
-                            namespace: signingProviderContext.namespace,
-                            hint: partyHint,
-                        }
-                    } else {
-                        const formattedPublicKey = Buffer.from(
-                            key.publicKey,
-                            'hex'
-                        ).toString('base64')
-                        const namespace =
-                            partyAllocator.createFingerprintFromKey(
-                                formattedPublicKey
-                            )
-                        const transactions =
-                            await partyAllocator.generateTopologyTransactions(
-                                partyHint,
-                                formattedPublicKey
-                            )
-                        topologyTransactions =
-                            transactions.topologyTransactions!
-                        let partyId = ''
-
-                        const { status, txId: id } =
-                            await driver.signTransaction({
-                                tx: '',
-                                txHash: Buffer.from(
-                                    transactions.multiHash,
-                                    'base64'
-                                ).toString('hex'),
-                                keyIdentifier: {
-                                    publicKey: key.publicKey,
-                                },
-                            })
-                        if (status === 'signed') {
-                            const { signature } = await driver.getTransaction({
-                                userId,
-                                txId: id,
-                            })
-                            partyId =
-                                await partyAllocator.allocatePartyWithExistingWallet(
-                                    namespace,
-                                    transactions.topologyTransactions!,
-                                    Buffer.from(signature, 'hex').toString(
-                                        'base64'
-                                    ),
-                                    userId
-                                )
-                        } else {
-                            txId = id
-                            walletStatus = 'initialized'
-                        }
-
-                        party = {
-                            partyId,
-                            namespace,
-                            hint: partyHint,
-                        }
-                    }
-                    publicKey = key.publicKey
-                    break
-                }
-                default:
-                    throw new Error(
-                        `Unsupported signing provider: ${signingProviderId}`
-                    )
-            }
-
-            const { partyId, ...partyArgs } = party
-
-            const wallet = {
-                signingProviderId,
-                networkId: network.id,
-                status: walletStatus,
-                primary: primary ?? false,
-                publicKey: publicKey || partyArgs.namespace,
-                externalTxId: txId,
-                topologyTransactions: topologyTransactions?.join(', ') ?? '',
-                partyId:
-                    partyId !== ''
-                        ? partyId
-                        : `${partyArgs.hint}::${partyArgs.namespace}`,
-                ...partyArgs,
-            } as Wallet
-
-            if (
-                signingProviderContext &&
-                (walletStatus === 'allocated' || walletStatus === 'initialized')
-            ) {
-                await store.updateWallet({
-                    partyId: wallet.partyId,
-                    networkId: wallet.networkId,
-                    status: wallet.status,
-                    externalTxId: wallet.externalTxId!,
-                })
-            } else if (!signingProviderContext) {
-                await store.addWallet(wallet)
-            }
-
+            // Notify about the change and return the new wallet
             const wallets = await store.getWallets()
+            notifier?.emit('accountsChanged', wallets)
+
+            return { wallet }
+        },
+        allocatePartyForWallet: async (
+            params: AllocatePartyForWalletParams
+        ) => {
+            logger.info(
+                `Allocating party for wallet: ${JSON.stringify(params)}`
+            )
+
+            const connectedContext = assertConnected(authContext)
+            const userId = connectedContext.userId
+            const email = await resolveUserEmail(connectedContext)
+
+            const notifier = notificationService.getNotifier(userId)
+            const network = await store.getCurrentNetwork()
+            if (!network) {
+                throw new Error('No network session found')
+            }
+
+            const allWallets = await store.getWallets()
+            const existingWallet = allWallets.find(
+                (w) =>
+                    w.partyId === params.partyId && w.networkId === network.id
+            )
+            if (!existingWallet) {
+                throw new Error(`Wallet not found for party ${params.partyId}`)
+            }
+
+            const idp = await store.getIdp(network.identityProviderId)
+
+            if (!network.adminAuth) {
+                throw new Error('No admin auth configured')
+            }
+
+            const accessTokenProvider = AuthTokenProvider.fromGatewayConfig(
+                idp,
+                network.adminAuth,
+                logger
+            )
+            const partyAllocator = new PartyAllocationService({
+                synchronizerId: network.synchronizerId,
+                accessTokenProvider,
+                httpLedgerUrl: network.ledgerApi.baseUrl,
+                logger,
+            })
+            const walletAllocationService = new WalletAllocationService(
+                store,
+                logger,
+                partyAllocator,
+                drivers
+            )
+
+            const signingProviderId =
+                existingWallet.signingProviderId as SigningProvider
+            if (!drivers[signingProviderId]) {
+                throw new Error(
+                    `Signing provider ${signingProviderId} not supported`
+                )
+            }
+
+            await walletAllocationService.allocateParty(
+                userId,
+                email,
+                existingWallet,
+                signingProviderId
+            )
+
+            // Sync wallets (TODO: separate rights sync from wallet sync as we only need rights sync here)
+            const ledgerClient = new LedgerClient({
+                baseUrl: new URL(network.ledgerApi.baseUrl),
+                logger,
+                accessTokenProvider: AuthTokenProvider.fromToken(
+                    authContext!.accessToken,
+                    logger
+                ),
+            })
+            const service = new WalletSyncService(
+                store,
+                ledgerClient,
+                authContext!,
+                logger,
+                drivers,
+                partyAllocator
+            )
+            await service.syncWallets()
+
+            // Notify about the change and return the updated wallet
+            const wallets = await store.getWallets()
+            const wallet = wallets.find(
+                (w) =>
+                    w.partyId === existingWallet.partyId &&
+                    w.networkId === network.id
+            )!
             notifier?.emit('accountsChanged', wallets)
 
             return { wallet }
@@ -467,142 +385,73 @@ export const userController = (
         removeWallet: async (params: { partyId: string }) =>
             Promise.resolve({}),
         listWallets: async (params: {
-            filter?: { networkIds?: string[]; signingProviderIds?: string[] }
+            filter?: { signingProviderIds?: string[] }
         }) => {
-            return await store.getAllWallets(params.filter)
+            return await store.getWallets(params.filter)
         },
-        sign: async ({
-            preparedTransaction,
-            preparedTransactionHash,
-            partyId,
-            commandId,
-        }: SignParams) => {
+        sign: async (signParams: SignParams) => {
             const network = await store.getCurrentNetwork()
             if (network === undefined) {
                 throw new Error('No network session found')
             }
 
             const wallets = await store.getWallets()
-            const wallet = wallets.find((w) => w.partyId === partyId)
+            const wallet = wallets.find((w) => w.partyId === signParams.partyId)
 
             if (wallet === undefined) {
                 throw new Error('No primary wallet found')
             }
 
-            const userId = assertConnected(authContext).userId
+            const connectedContext = assertConnected(authContext)
+            const userId = connectedContext.userId
+            const email = await resolveUserEmail(connectedContext)
 
             const notifier = notificationService.getNotifier(userId)
             const signingProvider = wallet.signingProviderId as SigningProvider
             const driver = drivers[signingProvider]?.controller(userId)
 
             if (!driver) {
-                throw new Error('No driver found for WALLET_KERNEL')
+                throw new Error(
+                    `No driver found for ${wallet.signingProviderId}`
+                )
             }
+
+            const transactionService = new TransactionService(
+                store,
+                logger,
+                drivers,
+                notifier
+            )
 
             switch (wallet.signingProviderId) {
                 case SigningProvider.PARTICIPANT: {
-                    return {
-                        signature: 'none',
-                        signedBy: wallet.namespace,
-                        partyId,
-                    }
+                    return transactionService.signWithParticipant(wallet)
                 }
                 case SigningProvider.WALLET_KERNEL: {
-                    const signature = await driver.signTransaction({
-                        tx: preparedTransaction,
-                        txHash: preparedTransactionHash,
-                        keyIdentifier: {
-                            publicKey: wallet.publicKey,
-                        },
-                    })
-
-                    if (!signature.signature) {
-                        throw new Error(
-                            'Failed to sign transaction: ' +
-                                JSON.stringify(signature)
-                        )
-                    }
-
-                    // Get existing transaction to preserve createdAt and origin if they exist
-                    const existingTx = await store.getTransaction(commandId)
-                    const now = new Date()
-
-                    const signedTx: Transaction = {
-                        commandId,
-                        status: 'signed',
-                        preparedTransaction,
-                        preparedTransactionHash,
-                        origin: existingTx?.origin ?? null,
-                        ...(existingTx?.createdAt && {
-                            createdAt: existingTx.createdAt,
-                        }),
-                        signedAt: now,
-                    }
-
-                    store.setTransaction(signedTx)
-                    notifier.emit('txChanged', signedTx)
-
-                    return {
-                        signature: signature.signature,
-                        signedBy: wallet.namespace,
-                        partyId: wallet.partyId,
-                    }
+                    return transactionService.signWithWalletKernel(
+                        userId,
+                        wallet,
+                        signParams
+                    )
                 }
                 case SigningProvider.BLOCKDAEMON: {
-                    const internalTxId = crypto
-                        .randomUUID()
-                        .replace(/-/g, '')
-                        .substring(0, 16)
-                    let result = await driver.signTransaction({
-                        tx: preparedTransaction,
-                        txHash: preparedTransactionHash,
-                        keyIdentifier: {
-                            publicKey: wallet.publicKey,
-                        },
-                        internalTxId,
-                    })
-
-                    if (result.status === 'pending' && result.txId) {
-                        for (let i = 0; i < 60; i++) {
-                            await new Promise((r) => setTimeout(r, 1000))
-                            result = await driver.getTransaction({
-                                userId,
-                                txId: result.txId,
-                            })
-                            if (result.status === 'signed') break
-                        }
-                    }
-
-                    if (!result.signature) {
+                    if (!email) {
                         throw new Error(
-                            'Signing timed out or failed: ' +
-                                JSON.stringify(result)
+                            'Email is required for Blockdaemon wallet allocation'
                         )
                     }
-
-                    const existingTx = await store.getTransaction(commandId)
-                    const now = new Date()
-
-                    const signedTx: Transaction = {
-                        commandId,
-                        status: 'signed',
-                        preparedTransaction,
-                        preparedTransactionHash,
-                        origin: existingTx?.origin ?? null,
-                        ...(existingTx?.createdAt && {
-                            createdAt: existingTx.createdAt,
-                        }),
-                        signedAt: now,
-                    }
-
-                    store.setTransaction(signedTx)
-                    notifier.emit('txChanged', signedTx)
-
-                    return {
-                        signature: result.signature,
-                        signedBy: wallet.namespace,
-                        partyId: wallet.partyId,
-                    }
+                    return transactionService.signWithBlockdaemon(
+                        email,
+                        wallet,
+                        signParams
+                    )
+                }
+                case SigningProvider.FIREBLOCKS: {
+                    return transactionService.signWithFireblocks(
+                        userId,
+                        wallet,
+                        signParams
+                    )
                 }
                 default:
                     throw new Error(
@@ -610,15 +459,15 @@ export const userController = (
                     )
             }
         },
-        execute: async ({
-            commandId,
-            signature,
-            signedBy,
-            partyId,
-        }: ExecuteParams) => {
-            const wallet = await store.getPrimaryWallet()
+        execute: async (executeParams: ExecuteParams) => {
+            const wallets = await store.getWallets()
             const network = await store.getCurrentNetwork()
-            const transaction = await store.getTransaction(commandId)
+            const transaction = await store.getTransaction(
+                executeParams.transactionId
+            )
+            const wallet = wallets.find(
+                (w) => w.partyId === executeParams.partyId
+            )
 
             if (wallet === undefined) {
                 throw new Error('No primary wallet found')
@@ -637,10 +486,10 @@ export const userController = (
             const notifier = notificationService.getNotifier(userId)
 
             // Create AccessTokenProvider for user token
-            const userAccessTokenProvider: AccessTokenProvider = {
-                getUserAccessToken: async () => authContext!.accessToken,
-                getAdminAccessToken: async () => authContext!.accessToken,
-            }
+            const userAccessTokenProvider = AuthTokenProvider.fromToken(
+                authContext!.accessToken,
+                logger
+            )
 
             const ledgerClient = new LedgerClient({
                 baseUrl: new URL(network.ledgerApi.baseUrl),
@@ -648,100 +497,37 @@ export const userController = (
                 accessTokenProvider: userAccessTokenProvider,
             })
 
+            const transactionService = new TransactionService(
+                store,
+                logger,
+                drivers,
+                notifier
+            )
+
             switch (wallet.signingProviderId) {
                 case SigningProvider.PARTICIPANT: {
-                    const synchronizerId =
-                        network.synchronizerId ??
-                        (await ledgerClient.getSynchronizerId())
-                    // Participant signing provider specific logic can be added here
                     try {
-                        const prep = ledgerPrepareParams(
+                        return await transactionService.executeWithParticipant(
                             userId,
-                            partyId,
-                            synchronizerId,
-                            transaction.payload as PrepareParams
+                            executeParams,
+                            transaction,
+                            ledgerClient,
+                            network
                         )
-                        const res = await ledgerClient.postWithRetry(
-                            '/v2/commands/submit-and-wait',
-                            prep
-                        )
-                        const signedTx: Transaction = {
-                            commandId,
-                            status: 'executed',
-                            preparedTransaction:
-                                transaction.preparedTransaction,
-                            preparedTransactionHash:
-                                transaction.preparedTransactionHash,
-                            payload: res,
-                            origin: transaction.origin ?? null,
-                            ...(transaction.createdAt && {
-                                createdAt: transaction.createdAt,
-                            }),
-                            ...(transaction.signedAt && {
-                                signedAt: transaction.signedAt,
-                            }),
-                        }
-                        store.setTransaction(signedTx)
-                        notifier.emit('txChanged', signedTx)
-
-                        return res
                     } catch (error) {
                         logger.error(error, 'Failed to submit transaction')
                         throw error
                     }
                 }
                 case SigningProvider.WALLET_KERNEL:
-                case SigningProvider.BLOCKDAEMON: {
-                    const result = await ledgerClient.postWithRetry(
-                        '/v2/interactive-submission/execute',
-                        {
-                            userId,
-                            preparedTransaction:
-                                transaction.preparedTransaction,
-                            hashingSchemeVersion: 'HASHING_SCHEME_VERSION_V2',
-                            submissionId: commandId,
-                            deduplicationPeriod: {
-                                Empty: {},
-                            },
-                            partySignatures: {
-                                signatures: [
-                                    {
-                                        party: partyId,
-                                        signatures: [
-                                            {
-                                                signature,
-                                                signedBy,
-                                                format: 'SIGNATURE_FORMAT_CONCAT',
-                                                signingAlgorithmSpec:
-                                                    'SIGNING_ALGORITHM_SPEC_ED25519',
-                                            },
-                                        ],
-                                    },
-                                ],
-                            },
-                        }
+                case SigningProvider.BLOCKDAEMON:
+                case SigningProvider.FIREBLOCKS: {
+                    return transactionService.executeWithExternal(
+                        userId,
+                        executeParams,
+                        transaction,
+                        ledgerClient
                     )
-
-                    const signedTx: Transaction = {
-                        commandId,
-                        status: 'executed',
-                        preparedTransaction: transaction.preparedTransaction,
-                        preparedTransactionHash:
-                            transaction.preparedTransactionHash,
-                        payload: result,
-                        origin: transaction.origin ?? null,
-                        ...(transaction.createdAt && {
-                            createdAt: transaction.createdAt,
-                        }),
-                        ...(transaction.signedAt && {
-                            signedAt: transaction.signedAt,
-                        }),
-                    }
-
-                    store.setTransaction(signedTx)
-                    notifier.emit('txChanged', signedTx)
-
-                    return result
                 }
                 default:
                     throw new Error(
@@ -772,39 +558,46 @@ export const userController = (
                 const ledgerClient = new LedgerClient({
                     baseUrl: new URL(network.ledgerApi.baseUrl),
                     logger,
-                    accessToken,
+                    accessTokenProvider: AuthTokenProvider.fromToken(
+                        accessToken,
+                        logger
+                    ),
                 })
                 const status = await networkStatus(ledgerClient)
-                notifier.emit('statusChanged', {
-                    kernel: {
-                        ...kernelInfo,
-                        userUrl: `${userUrl}/login/`,
+                const statusEvent: StatusEvent = {
+                    provider: provider,
+                    connection: {
+                        isConnected: status.isConnected,
+                        reason: status.reason ? status.reason : 'OK',
+                        isNetworkConnected: status.isConnected,
+                        networkReason: status.reason ? status.reason : 'OK',
                     },
-                    isConnected: true,
-                    isNetworkConnected: status.isConnected,
-                    networkReason: status.reason ? status.reason : 'OK',
                     network: {
                         networkId: network.id,
-                        ledgerApi: {
-                            baseUrl: network.ledgerApi.baseUrl,
-                        },
+                        ledgerApi: network.ledgerApi.baseUrl,
+                        accessToken: accessToken,
                     },
                     session: {
-                        id: newSessionId,
                         accessToken: accessToken,
                         userId: userId,
                     },
-                })
+                }
+                notifier.emit('statusChanged', statusEvent)
+                notifier.emit('connected', statusEvent)
 
                 //we only want to automatically perform a sync if it is the first time a session is created
                 const wallets = await store.getWallets()
                 if (wallets.length == 0) {
-                    const adminAccessTokenProvider = new AuthTokenProvider(
-                        idp,
-                        network.auth,
-                        network.adminAuth,
-                        logger
-                    )
+                    if (!network.adminAuth) {
+                        throw new Error('No admin auth configured')
+                    }
+
+                    const adminAccessTokenProvider =
+                        AuthTokenProvider.fromGatewayConfig(
+                            idp,
+                            network.adminAuth,
+                            logger
+                        )
                     const partyAllocator = new PartyAllocationService({
                         synchronizerId: network.synchronizerId,
                         accessTokenProvider: adminAccessTokenProvider,
@@ -815,7 +608,6 @@ export const userController = (
                     const service = new WalletSyncService(
                         store,
                         ledgerClient,
-                        ledgerClient,
                         authContext!,
                         logger,
                         drivers,
@@ -824,17 +616,24 @@ export const userController = (
                     await service.syncWallets()
                 }
 
-                return Promise.resolve({
+                const rights = await store.getUserRights(network.id)
+                return {
                     id: newSessionId,
                     accessToken,
-                    network,
+                    network: {
+                        ...network,
+                        ledgerApi: network.ledgerApi.baseUrl,
+                    },
                     idp,
                     status: status.isConnected ? 'connected' : 'disconnected',
                     reason: status.reason ? status.reason : 'OK',
-                })
+                    rights: rights,
+                }
             } catch (error) {
-                logger.error(`Failed to add session: ${error}`)
-                throw new Error(`Failed to add session: ${error}`)
+                logger.error({ error }, 'Failed to add session')
+                throw new Error(`Failed to add session`, {
+                    cause: error,
+                })
             }
         },
         removeSession: async (): Promise<Null> => {
@@ -844,12 +643,17 @@ export const userController = (
             await store.removeSession()
 
             notifier.emit('statusChanged', {
-                kernel: kernelInfo,
-                isConnected: false,
-                isNetworkConnected: false,
-                networkReason: 'removed session',
+                provider: provider,
+                connection: {
+                    isConnected: false,
+                    reason: 'disconnect',
+                    isNetworkConnected: false,
+                    networkReason: 'removed session',
+                },
+                network: undefined,
+                session: undefined,
                 userUrl: `${userUrl}/login/`,
-            } as StatusEvent)
+            })
 
             return null
         },
@@ -863,21 +667,29 @@ export const userController = (
             const ledgerClient = new LedgerClient({
                 baseUrl: new URL(network.ledgerApi.baseUrl),
                 logger,
-                accessToken: authContext!.accessToken,
+                accessTokenProvider: AuthTokenProvider.fromToken(
+                    authContext!.accessToken,
+                    logger
+                ),
             })
             const idp = await store.getIdp(network.identityProviderId)
             const status = await networkStatus(ledgerClient)
+            const rights = await store.getUserRights(network.id)
             return {
                 sessions: [
                     {
                         id: session.id,
-                        network,
+                        network: {
+                            ...network,
+                            ledgerApi: network.ledgerApi.baseUrl,
+                        },
                         idp: idp,
                         accessToken: authContext!.accessToken,
                         status: status.isConnected
                             ? 'connected'
                             : 'disconnected',
                         reason: status.reason ? status.reason : 'OK',
+                        rights: rights,
                     },
                 ],
             }
@@ -886,18 +698,23 @@ export const userController = (
             const network = await store.getCurrentNetwork()
             const { userId } = assertConnected(authContext)
 
-            const userAccessTokenProvider: AccessTokenProvider = {
-                getUserAccessToken: async () => authContext!.accessToken,
-                getAdminAccessToken: async () => authContext!.accessToken,
-            }
-
-            const idp = await store.getIdp(network.identityProviderId)
-            const adminAccessTokenProvider = new AuthTokenProvider(
-                idp,
-                network.auth,
-                network.adminAuth,
+            const userAccessTokenProvider = AuthTokenProvider.fromToken(
+                authContext!.accessToken,
                 logger
             )
+
+            const idp = await store.getIdp(network.identityProviderId)
+
+            if (!network.adminAuth) {
+                throw new Error('No admin auth configured')
+            }
+
+            const adminAccessTokenProvider =
+                AuthTokenProvider.fromGatewayConfig(
+                    idp,
+                    network.adminAuth,
+                    logger
+                )
 
             const partyAllocator = new PartyAllocationService({
                 synchronizerId: network.synchronizerId,
@@ -912,24 +729,19 @@ export const userController = (
                 accessTokenProvider: userAccessTokenProvider,
             })
 
-            const adminLedger = new LedgerClient({
-                baseUrl: new URL(network.ledgerApi.baseUrl),
-                logger,
-                isAdmin: true,
-                accessTokenProvider: adminAccessTokenProvider,
-            })
-
             const service = new WalletSyncService(
                 store,
                 userLedger,
-                adminLedger,
                 authContext!,
                 logger,
                 drivers,
                 partyAllocator
             )
             const result = await service.syncWallets()
-            if (result.added.length === 0 && result.removed.length === 0) {
+            if (
+                (result.added.length === 0 && result.updated.length === 0) ||
+                result.disabled.length === 0
+            ) {
                 return result
             }
             const notifier = notificationService.getNotifier(userId)
@@ -941,18 +753,23 @@ export const userController = (
             const network = await store.getCurrentNetwork()
             assertConnected(authContext)
 
-            const userAccessTokenProvider: AccessTokenProvider = {
-                getUserAccessToken: async () => authContext!.accessToken,
-                getAdminAccessToken: async () => authContext!.accessToken,
-            }
-
-            const idp = await store.getIdp(network.identityProviderId)
-            const adminAccessTokenProvider = new AuthTokenProvider(
-                idp,
-                network.auth,
-                network.adminAuth,
+            const userAccessTokenProvider = AuthTokenProvider.fromToken(
+                authContext!.accessToken,
                 logger
             )
+
+            const idp = await store.getIdp(network.identityProviderId)
+
+            if (!network.adminAuth) {
+                throw new Error('No admin auth configured')
+            }
+
+            const adminAccessTokenProvider =
+                AuthTokenProvider.fromGatewayConfig(
+                    idp,
+                    network.adminAuth,
+                    logger
+                )
 
             const partyAllocator = new PartyAllocationService({
                 synchronizerId: network.synchronizerId,
@@ -967,17 +784,9 @@ export const userController = (
                 accessTokenProvider: userAccessTokenProvider,
             })
 
-            const adminLedger = new LedgerClient({
-                baseUrl: new URL(network.ledgerApi.baseUrl),
-                logger,
-                isAdmin: true,
-                accessTokenProvider: adminAccessTokenProvider,
-            })
-
             const service = new WalletSyncService(
                 store,
                 userLedger,
-                adminLedger,
                 authContext!,
                 logger,
                 drivers,
@@ -989,13 +798,14 @@ export const userController = (
         getTransaction: async (
             params: GetTransactionParams
         ): Promise<GetTransactionResult> => {
-            const transaction = await store.getTransaction(params.commandId)
+            const transaction = await store.getTransaction(params.transactionId)
             if (!transaction) {
                 throw new Error(
-                    `Transaction not found with commandId: ${params.commandId}`
+                    `Transaction not found with id: ${params.transactionId}`
                 )
             }
             return {
+                id: transaction.id,
                 commandId: transaction.commandId,
                 status: transaction.status,
                 preparedTransaction: transaction.preparedTransaction,
@@ -1011,12 +821,16 @@ export const userController = (
                 }),
                 ...(transaction.signedAt && {
                     signedAt: transaction.signedAt.toISOString(),
+                }),
+                ...(transaction.externalTxId && {
+                    externalTxId: transaction.externalTxId,
                 }),
             }
         },
         listTransactions: async function (): Promise<ListTransactionsResult> {
             const transactions = await store.listTransactions()
             const txs = transactions.map((transaction) => ({
+                id: transaction.id,
                 commandId: transaction.commandId,
                 status: transaction.status,
                 preparedTransaction: transaction.preparedTransaction,
@@ -1033,8 +847,28 @@ export const userController = (
                 ...(transaction.signedAt && {
                     signedAt: transaction.signedAt.toISOString(),
                 }),
+                ...(transaction.externalTxId && {
+                    externalTxId: transaction.externalTxId,
+                }),
             }))
             return { transactions: txs }
+        },
+        deleteTransaction: async (
+            params: DeleteTransactionParams
+        ): Promise<Null> => {
+            const transaction = await store.getTransaction(params.transactionId)
+            if (!transaction) {
+                throw new Error(
+                    `Transaction not found with id: ${params.transactionId}`
+                )
+            }
+            if (transaction.status !== 'pending') {
+                throw new Error(
+                    `Cannot delete transaction with status '${transaction.status}'. Only pending transactions can be deleted.`
+                )
+            }
+            await store.removeTransaction(transaction.id)
+            return null
         },
     })
 }

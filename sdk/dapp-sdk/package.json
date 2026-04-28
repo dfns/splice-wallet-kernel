@@ -1,7 +1,7 @@
 {
     "name": "@canton-network/dapp-sdk",
     "type": "module",
-    "version": "0.20.0",
+    "version": "1.1.0",
     "description": "Browser SDK for dApp development on the Canton Network",
     "license": "Apache-2.0",
     "author": "Marc Juchli <marc.juchli@digitalasset.com>",
@@ -17,22 +17,47 @@
         }
     },
     "scripts": {
-        "build": "tsup && tsc -p tsconfig.types.json",
-        "dev": "tsup --watch --onSuccess \"tsc -p tsconfig.types.json\"",
+        "build": "tsup --onSuccess \"tsc\"",
+        "dev": "tsup --watch --onSuccess \"tsc\"",
         "flatpack": "yarn pack --out \"$FLATPACK_OUTDIR\"",
         "clean": "tsc -b --clean; rm -rf dist",
-        "test": "echo \"Warning: no test specified\""
+        "test": "vitest run --project browser --passWithNoTests",
+        "test:coverage": "vitest run --project browser --coverage --passWithNoTests"
     },
     "dependencies": {
+        "@canton-network/core-provider-dapp": "workspace:^",
+        "@canton-network/core-rpc-transport": "workspace:^",
         "@canton-network/core-splice-provider": "workspace:^",
         "@canton-network/core-types": "workspace:^",
         "@canton-network/core-wallet-dapp-remote-rpc-client": "workspace:^",
         "@canton-network/core-wallet-dapp-rpc-client": "workspace:^",
-        "@canton-network/core-wallet-ui-components": "workspace:^"
+        "@canton-network/core-wallet-discovery": "workspace:^",
+        "@canton-network/core-wallet-ui-components": "workspace:^",
+        "qrcode": "^1.5.4"
+    },
+    "peerDependencies": {
+        "@walletconnect/sign-client": "^2.23.8",
+        "@walletconnect/types": "^2.23.8"
+    },
+    "peerDependenciesMeta": {
+        "@walletconnect/sign-client": {
+            "optional": true
+        },
+        "@walletconnect/types": {
+            "optional": true
+        }
     },
     "devDependencies": {
+        "@types/qrcode": "^1.5.6",
+        "@vitest/browser-playwright": "^4.1.2",
+        "@vitest/coverage-v8": "^4.1.2",
+        "@walletconnect/sign-client": "^2.23.8",
+        "@walletconnect/types": "^2.23.8",
+        "playwright": "^1.58.2",
+        "qrcode": "^1.5.4",
         "tsup": "^8.5.1",
-        "typescript": "^5.9.3"
+        "typescript": "^5.9.3",
+        "vitest": "^4.1.2"
     },
     "files": [
         "dist/**",

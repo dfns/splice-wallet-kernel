@@ -1,7 +1,7 @@
 {
     "name": "@canton-network/core-wallet-test-utils",
     "private": true,
-    "version": "0.2.0",
+    "version": "1.1.0",
     "type": "module",
     "description": "Utilities for writing (E2E) tests for the wallet gateway",
     "main": "dist/index.cjs",
@@ -18,19 +18,23 @@
     "dependencies": {
         "@canton-network/core-types": "workspace:^",
         "@canton-network/wallet-sdk": "workspace:^",
-        "@playwright/test": "^1.57.0",
-        "pino": "^10.2.1",
-        "uuid": "^11.1.0"
+        "@playwright/test": "^1.58.2",
+        "pino": "^10.3.1",
+        "uuid": "^14.0.0"
     },
     "devDependencies": {
+        "@vitest/coverage-v8": "^4.1.2",
         "tsup": "^8.5.1",
-        "typescript": "^5.9.3"
+        "typescript": "^5.9.3",
+        "vitest": "^4.1.2"
     },
     "scripts": {
-        "build": "tsup && tsc -p tsconfig.types.json",
-        "dev": "tsup --watch --onSuccess \"tsc -p tsconfig.types.json\"",
+        "build": "tsup --onSuccess \"tsc\"",
+        "dev": "tsup --watch --onSuccess \"tsc\"",
         "clean": "tsc -b --clean; rm -rf dist",
-        "flatpack": "yarn pack --out \"$FLATPACK_OUTDIR\""
+        "flatpack": "yarn pack --out \"$FLATPACK_OUTDIR\"",
+        "test": "vitest run --project node --passWithNoTests",
+        "test:coverage": "vitest run --project node --coverage --passWithNoTests"
     },
     "files": [
         "dist/**"

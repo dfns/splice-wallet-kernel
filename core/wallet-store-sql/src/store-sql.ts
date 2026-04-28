@@ -20,6 +20,9 @@ import {
     StoreConfig,
     UpdateWallet,
     CurrentNetworkWalletFilter,
+    PartyLevelRight,
+    TransactionStatusUpdate,
+    UserLevelRight,
 } from '@canton-network/core-wallet-store'
 import { CamelCasePlugin, Kysely, PostgresDialect, SqliteDialect } from 'kysely'
 import Database from 'better-sqlite3'
@@ -29,6 +32,9 @@ import {
     fromNetwork,
     fromTransaction,
     fromWallet,
+    fromPartyRight,
+    fromUserRight,
+    toWalletUpdateProperties,
     toIdp,
     toNetwork,
     toTransaction,
@@ -72,6 +78,21 @@ export class StoreSql implements BaseStore, AuthAware<StoreSql> {
             .where('userId', '=', userId)
             .execute()
 
+        const userPartyRights = await this.db
+            .selectFrom('userPartyRights')
+            .selectAll()
+            .where('userId', '=', userId)
+            .execute()
+
+        const rightsByWallet = new Map<string, PartyLevelRight[]>()
+        for (const row of userPartyRights) {
+            const right = fromPartyRight(row.right)
+            if (!right) continue
+            const key = `${row.partyId}:${row.networkId}`
+            const existing = rightsByWallet.get(key) ?? []
+            rightsByWallet.set(key, [...existing, right])
+        }
+
         return wallets
             .filter((wallet) => {
                 const matchedNetworkIds = networkIdSet
@@ -82,25 +103,16 @@ export class StoreSql implements BaseStore, AuthAware<StoreSql> {
                     : true
                 return matchedNetworkIds && matchedSigningProviderIds
             })
-            .map((table) =>
-                toWallet({
-                    primary: table.primary,
-                    partyId: table.partyId,
-                    hint: table.hint,
-                    publicKey: table.publicKey,
-                    namespace: table.namespace,
-                    networkId: table.networkId,
-                    signingProviderId: table.signingProviderId,
-                    userId: table.userId,
-                    externalTxId: table.externalTxId ?? '',
-                    topologyTransactions: table.topologyTransactions ?? '',
-                    status: table.status ?? '',
-                    disabled: table.disabled ?? 0,
-                    ...(table.reason !== undefined && {
-                        reason: table.reason,
-                    }),
-                })
-            )
+            .map((table) => {
+                const wallet = toWallet(table)
+                const rights = rightsByWallet.get(
+                    `${table.partyId}:${table.networkId}`
+                )
+                return {
+                    ...wallet,
+                    rights: rights ?? [],
+                }
+            })
     }
 
     async getWallets(
@@ -165,114 +177,116 @@ export class StoreSql implements BaseStore, AuthAware<StoreSql> {
         this.logger.info('Adding wallet')
         const userId = this.assertConnected()
 
-        // Check if this is the first wallet in this network for this user
-        const wallets = await this.getAllWallets({
-            networkIds: [wallet.networkId],
-        })
-        const isFirstWallet = wallets.length === 0
-        if (isFirstWallet) {
+        const wallets = await this.getWallets()
+        if (
+            wallets.some(
+                (w) =>
+                    w.partyId === wallet.partyId &&
+                    w.networkId === wallet.networkId
+            )
+        ) {
+            throw new Error(
+                `Wallet with partyId "${wallet.partyId}" networkId "${wallet.networkId}" userId "${userId}" already exists`
+            )
+        }
+
+        if (
+            !wallet.disabled &&
+            wallet.status === 'allocated' &&
+            !wallets.some((wallet) => wallet.primary)
+        ) {
+            // If there is no primary wallet yet, set current one as primary (unless disabled or not allocated).
+            // In regular case it would be the first added wallet.
             wallet.primary = true
         }
 
         await this.db.transaction().execute(async (trx) => {
-            // Check if wallet already exists (possibly from a different user)
-            const existingWallet = await trx
-                .selectFrom('wallets')
-                .selectAll()
-                .where((eb) =>
-                    eb.and([
-                        eb('partyId', '=', wallet.partyId),
-                        eb('networkId', '=', wallet.networkId),
-                    ])
-                )
-                .executeTakeFirst()
-
-            if (existingWallet) {
-                // Wallet exists - update it (handles case where network was edited to use different user)
-                this.logger.info(
-                    {
-                        partyId: wallet.partyId,
-                        networkId: wallet.networkId,
-                        oldUserId: existingWallet.userId,
-                        newUserId: userId,
-                    },
-                    'Updating existing wallet (possibly from different user)'
-                )
-
-                if (wallet.primary) {
-                    // If the new wallet is primary, set all others in the same network to non-primary
-                    await trx
-                        .updateTable('wallets')
-                        .set({ primary: 0 })
-                        .where((eb) =>
-                            eb.and([
-                                eb('primary', '=', 1),
-                                eb('networkId', '=', wallet.networkId),
-                                eb('userId', '=', userId),
-                            ])
-                        )
-                        .execute()
-                }
-
-                // Update the existing wallet with new data and user
+            if (wallet.primary) {
+                // If the new wallet is primary, set all others in the same network and for this user to non-primary
                 await trx
                     .updateTable('wallets')
-                    .set(fromWallet(wallet, userId))
+                    .set({ primary: 0 })
                     .where((eb) =>
                         eb.and([
-                            eb('partyId', '=', wallet.partyId),
+                            eb('primary', '=', 1),
                             eb('networkId', '=', wallet.networkId),
+                            eb('userId', '=', userId),
                         ])
                     )
                     .execute()
-            } else {
-                // Wallet doesn't exist - insert it
-                if (wallet.primary) {
-                    // If the new wallet is primary, set all others in the same network to non-primary
-                    await trx
-                        .updateTable('wallets')
-                        .set({ primary: 0 })
-                        .where((eb) =>
-                            eb.and([
-                                eb('primary', '=', 1),
-                                eb('networkId', '=', wallet.networkId),
-                                eb('userId', '=', userId),
-                            ])
-                        )
-                        .execute()
-                }
+            }
+            await trx
+                .insertInto('wallets')
+                .values(fromWallet(wallet, userId))
+                .execute()
+
+            if (wallet.rights && wallet.rights.length > 0) {
                 await trx
-                    .insertInto('wallets')
-                    .values(fromWallet(wallet, userId))
+                    .insertInto('userPartyRights')
+                    .values(
+                        wallet.rights.map((right) => ({
+                            userId,
+                            networkId: wallet.networkId,
+                            partyId: wallet.partyId,
+                            right,
+                        }))
+                    )
                     .execute()
             }
         })
     }
 
-    async updateWallet({
-        status,
-        partyId,
-        networkId,
-        externalTxId,
-    }: UpdateWallet): Promise<void> {
+    async updateWallet(params: UpdateWallet): Promise<void> {
+        const { partyId, networkId, rights } = params
         this.logger.info('Updating wallet')
         const userId = this.assertConnected()
 
-        // Use provided networkId or get current network from session
+        const updates = toWalletUpdateProperties(params)
+
         const targetNetworkId = networkId ?? (await this.getCurrentNetwork()).id
+        if (Object.keys(updates).length === 0 && rights === undefined) return
 
         await this.db.transaction().execute(async (trx) => {
-            await trx
-                .updateTable('wallets')
-                .set({ status, externalTxId })
-                .where((eb) =>
-                    eb.and([
-                        eb('partyId', '=', partyId),
-                        eb('networkId', '=', targetNetworkId),
-                        eb('userId', '=', userId),
-                    ])
-                )
-                .execute()
+            if (Object.keys(updates).length > 0) {
+                await trx
+                    .updateTable('wallets')
+                    .set(updates)
+                    .where((eb) =>
+                        eb.and([
+                            eb('partyId', '=', partyId),
+                            eb('networkId', '=', targetNetworkId),
+                            eb('userId', '=', userId),
+                        ])
+                    )
+                    .execute()
+            }
+
+            if (rights !== undefined) {
+                await trx
+                    .deleteFrom('userPartyRights')
+                    .where((eb) =>
+                        eb.and([
+                            eb('partyId', '=', partyId),
+                            eb('networkId', '=', targetNetworkId),
+                            eb('userId', '=', userId),
+                        ])
+                    )
+                    .execute()
+
+                if (rights.length > 0) {
+                    await trx
+                        .insertInto('userPartyRights')
+                        .values(
+                            rights.map((right) => ({
+                                userId,
+                                networkId: targetNetworkId,
+                                partyId,
+                                right,
+                            }))
+                        )
+                        .execute()
+                }
+            }
         })
     }
 
@@ -294,6 +308,57 @@ export class StoreSql implements BaseStore, AuthAware<StoreSql> {
                     ])
                 )
                 .execute()
+        })
+    }
+
+    async getUserRights(networkId?: string): Promise<Array<UserLevelRight>> {
+        const userId = this.assertConnected()
+        const targetNetworkId = networkId ?? (await this.getCurrentNetwork()).id
+        const rows = await this.db
+            .selectFrom('userRights')
+            .selectAll()
+            .where((eb) =>
+                eb.and([
+                    eb('userId', '=', userId),
+                    eb('networkId', '=', targetNetworkId),
+                ])
+            )
+            .execute()
+
+        return rows
+            .map((row) => fromUserRight(row.right))
+            .filter((right): right is UserLevelRight => right !== undefined)
+    }
+
+    async setUserRights(
+        networkId: string,
+        rights: Array<UserLevelRight>
+    ): Promise<void> {
+        const userId = this.assertConnected()
+
+        await this.db.transaction().execute(async (trx) => {
+            await trx
+                .deleteFrom('userRights')
+                .where((eb) =>
+                    eb.and([
+                        eb('userId', '=', userId),
+                        eb('networkId', '=', networkId),
+                    ])
+                )
+                .execute()
+
+            if (rights.length > 0) {
+                await trx
+                    .insertInto('userRights')
+                    .values(
+                        rights.map((right) => ({
+                            userId,
+                            networkId,
+                            right,
+                        }))
+                    )
+                    .execute()
+            }
         })
     }
 
@@ -519,27 +584,108 @@ export class StoreSql implements BaseStore, AuthAware<StoreSql> {
         })
     }
 
-    // Transaction methods
-    async setTransaction(transaction: Transaction): Promise<void> {
-        const userId = this.assertConnected()
+    private mergeTransactionStatusUpdate(
+        existing: Transaction,
+        status: Transaction['status'],
+        updates: TransactionStatusUpdate = {}
+    ): Transaction {
+        const payload = updates.payload ?? existing.payload
+        const signedAt = updates.signedAt ?? existing.signedAt
+        const externalTxId = updates.externalTxId ?? existing.externalTxId
 
-        const existing = await this.getTransaction(transaction.commandId)
-        if (existing) {
-            await this.db
-                .updateTable('transactions')
-                .set(fromTransaction(transaction, userId))
-                .where('commandId', '=', transaction.commandId)
-                .execute()
-        } else {
-            await this.db
-                .insertInto('transactions')
-                .values(fromTransaction(transaction, userId))
-                .execute()
+        return {
+            id: existing.id,
+            commandId: existing.commandId,
+            status,
+            preparedTransaction: existing.preparedTransaction,
+            preparedTransactionHash: existing.preparedTransactionHash,
+            origin: existing.origin,
+            ...(payload !== undefined && { payload }),
+            ...(existing.createdAt !== undefined && {
+                createdAt: existing.createdAt,
+            }),
+            ...(signedAt !== undefined && { signedAt }),
+            ...(externalTxId !== undefined && { externalTxId }),
         }
     }
 
-    async getTransaction(commandId: string): Promise<Transaction | undefined> {
+    // Transaction methods
+    async setTransaction(transaction: Transaction): Promise<void> {
         const userId = this.assertConnected()
+        const network = await this.getCurrentNetwork()
+
+        await this.db
+            .insertInto('transactions')
+            .values(fromTransaction(transaction, userId, network.id))
+            .execute()
+    }
+
+    async setTransactionSigned(
+        transactionId: string,
+        signedAt: Date,
+        externalTxId?: string
+    ): Promise<void> {
+        await this.setTransactionStatus(transactionId, 'signed', {
+            signedAt,
+            ...(externalTxId !== undefined && { externalTxId }),
+        })
+    }
+
+    async setTransactionStatus(
+        transactionId: string,
+        status: Transaction['status'],
+        updates: TransactionStatusUpdate = {}
+    ): Promise<void> {
+        const userId = this.assertConnected()
+        const network = await this.getCurrentNetwork()
+        const existing = await this.getTransaction(transactionId)
+        if (!existing) {
+            throw new Error(`Transaction not found with id: ${transactionId}`)
+        }
+
+        const updated = this.mergeTransactionStatusUpdate(
+            existing,
+            status,
+            updates
+        )
+
+        await this.db
+            .updateTable('transactions')
+            .set(fromTransaction(updated, userId, network.id))
+            .where((eb) =>
+                eb.and([
+                    eb('id', '=', transactionId),
+                    eb('userId', '=', userId),
+                    eb('networkId', '=', network.id),
+                ])
+            )
+            .execute()
+    }
+
+    async getTransaction(
+        transactionId: string
+    ): Promise<Transaction | undefined> {
+        const userId = this.assertConnected()
+        const network = await this.getCurrentNetwork()
+        const transaction = await this.db
+            .selectFrom('transactions')
+            .selectAll()
+            .where((eb) =>
+                eb.and([
+                    eb('id', '=', transactionId),
+                    eb('userId', '=', userId),
+                    eb('networkId', '=', network.id),
+                ])
+            )
+            .executeTakeFirst()
+        return transaction ? toTransaction(transaction) : undefined
+    }
+
+    async getLatestTransactionByCommandId(
+        commandId: string
+    ): Promise<Transaction | undefined> {
+        const userId = this.assertConnected()
+        const network = await this.getCurrentNetwork()
         const transaction = await this.db
             .selectFrom('transactions')
             .selectAll()
@@ -547,29 +693,61 @@ export class StoreSql implements BaseStore, AuthAware<StoreSql> {
                 eb.and([
                     eb('commandId', '=', commandId),
                     eb('userId', '=', userId),
+                    eb('networkId', '=', network.id),
                 ])
             )
+            .orderBy('createdAt', 'desc')
+            .orderBy('id', 'desc')
             .executeTakeFirst()
+
         return transaction ? toTransaction(transaction) : undefined
     }
 
     async listTransactions(): Promise<Array<Transaction>> {
         const userId = this.assertConnected()
+        const network = await this.getCurrentNetwork()
         const transactions = await this.db
             .selectFrom('transactions')
             .selectAll()
-            .where('userId', '=', userId)
+            .where((eb) =>
+                eb.and([
+                    eb('userId', '=', userId),
+                    eb('networkId', '=', network.id),
+                ])
+            )
             .execute()
         return transactions.map((table) => toTransaction(table))
+    }
+
+    async removeTransaction(transactionId: string): Promise<void> {
+        const userId = this.assertConnected()
+        const network = await this.getCurrentNetwork()
+        await this.db
+            .deleteFrom('transactions')
+            .where((eb) =>
+                eb.and([
+                    eb('id', '=', transactionId),
+                    eb('userId', '=', userId),
+                    eb('networkId', '=', network.id),
+                ])
+            )
+            .execute()
     }
 }
 
 export const connection = (config: StoreConfig) => {
+    let database
     switch (config.connection.type) {
         case 'sqlite':
+            database = new Database(config.connection.database)
+            // normally sqlite3 has foreign_keys = OFF for each connection,
+            // but better-sqlite3 uses custom build with compile flag SQLITE_DEFAULT_FOREIGN_KEYS=1,
+            // making it ON by default.
+            // Set explicitly ON anyway as redundancy
+            database.pragma('foreign_keys = ON')
             return new Kysely<DB>({
                 dialect: new SqliteDialect({
-                    database: new Database(config.connection.database),
+                    database,
                 }),
                 plugins: [new CamelCasePlugin()],
             })
@@ -587,9 +765,11 @@ export const connection = (config: StoreConfig) => {
                 plugins: [new CamelCasePlugin()],
             })
         case 'memory':
+            database = new Database(':memory:')
+            database.pragma('foreign_keys = ON')
             return new Kysely<DB>({
                 dialect: new SqliteDialect({
-                    database: new Database(':memory:'),
+                    database,
                 }),
                 plugins: [new CamelCasePlugin()],
             })

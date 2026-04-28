@@ -1,14 +1,7 @@
 // Copyright (c) 2025-2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import {
-    jest,
-    describe,
-    it,
-    expect,
-    beforeEach,
-    afterEach,
-} from '@jest/globals'
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { pino, Logger } from 'pino'
 import { sink } from 'pino-test'
 import {
@@ -23,19 +16,31 @@ import {
     connection,
     migrator,
 } from '@canton-network/core-signing-store-sql'
-import { AuthContext } from '@canton-network/core-wallet-auth'
+import {
+    AccessTokenProvider,
+    AuthContext,
+} from '@canton-network/core-wallet-auth'
 import { LedgerClient } from '@canton-network/core-ledger-client'
-import { Wallet, Network, Store } from '@canton-network/core-wallet-store'
+import {
+    Wallet,
+    Network,
+    Store,
+    PartyLevelRight,
+    WalletStatus,
+} from '@canton-network/core-wallet-store'
 import { StoreInternal } from '@canton-network/core-wallet-store-inmemory'
+import { WALLET_DISABLED_REASON } from '@canton-network/core-types'
 import { WalletSyncService } from './wallet-sync-service.js'
 import { PartyAllocationService } from './party-allocation-service.js'
 
 type AsyncFn = () => Promise<unknown>
 
-const mockLedgerGet = jest.fn<AsyncFn>()
+const { mockLedgerGet } = vi.hoisted(() => ({
+    mockLedgerGet: vi.fn<AsyncFn>(),
+}))
 
-jest.unstable_mockModule('@canton-network/core-ledger-client', () => ({
-    LedgerClient: jest.fn().mockImplementation(() => {
+vi.mock('@canton-network/core-ledger-client', () => ({
+    LedgerClient: vi.fn(function LedgerClientMock() {
         return {
             getWithRetry: mockLedgerGet,
         }
@@ -45,10 +50,24 @@ jest.unstable_mockModule('@canton-network/core-ledger-client', () => ({
 
 // Test subclass to expose protected method
 class TestableWalletSyncService extends WalletSyncService {
-    public async resolveSigningProvider(namespace: string) {
-        return super.resolveSigningProvider(namespace)
+    public async resolveSigningProvider(
+        partyNamespace: string,
+        participantNamespace: string
+    ) {
+        return super.resolveSigningProvider(
+            partyNamespace,
+            participantNamespace
+        )
     }
 }
+
+const testATP = (user: string, token: string): AccessTokenProvider => ({
+    getAccessToken: async () => token,
+    getAuthContext: async () => ({
+        userId: user,
+        accessToken: token,
+    }),
+})
 
 describe('WalletSyncService - resolveSigningProvider', () => {
     const authContext: AuthContext = {
@@ -88,10 +107,7 @@ describe('WalletSyncService - resolveSigningProvider', () => {
         // Create real PartyAllocationService
         partyAllocator = new PartyAllocationService({
             synchronizerId: 'test-sync-id',
-            accessTokenProvider: {
-                getUserAccessToken: async () => 'user.jwt',
-                getAdminAccessToken: async () => 'admin.jwt',
-            },
+            accessTokenProvider: testATP('admin', 'admin.jwt'),
             httpLedgerUrl: 'http://test',
             logger: mockLogger,
         })
@@ -101,16 +117,12 @@ describe('WalletSyncService - resolveSigningProvider', () => {
         ledgerClient = new ledgerModule.LedgerClient({
             baseUrl: new URL('http://test'),
             logger: mockLogger,
-            accessTokenProvider: {
-                getUserAccessToken: async () => 'token',
-                getAdminAccessToken: async () => 'token',
-            },
+            accessTokenProvider: testATP('token', 'token'),
         })
 
         // Create service with real drivers
         service = new TestableWalletSyncService(
             store,
-            ledgerClient,
             ledgerClient,
             authContext,
             mockLogger,
@@ -123,19 +135,17 @@ describe('WalletSyncService - resolveSigningProvider', () => {
     })
 
     afterEach(() => {
-        jest.restoreAllMocks()
+        vi.restoreAllMocks()
         mockLedgerGet.mockClear()
     })
 
     it('resolves participant when namespace matches participant namespace', async () => {
         const participantNamespace = 'participant-namespace-123'
-        const participantId = `participant1::${participantNamespace}`
-        mockLedgerGet.mockResolvedValueOnce({
-            participantId,
-        })
 
-        const result =
-            await service.resolveSigningProvider(participantNamespace)
+        const result = await service.resolveSigningProvider(
+            participantNamespace,
+            participantNamespace
+        )
 
         expect(result).not.toBeNull()
         expect(result).toEqual({
@@ -154,13 +164,20 @@ describe('WalletSyncService - resolveSigningProvider', () => {
         const controller = internalDriver.controller(authContext.userId)
         const key = await controller.createKey({ name: 'test-key' })
 
+        if ('error' in key) {
+            throw new Error(
+                `Failed to create key in test: ${key.error_description}`
+            )
+        }
+
         const namespace = partyAllocator.createFingerprintFromKey(key.publicKey)
 
-        mockLedgerGet.mockResolvedValueOnce({
-            participantId: 'participant1::different-participant-namespace',
-        })
+        const differentParticipantNamespace = 'different-participant-namespace'
 
-        const result = await service.resolveSigningProvider(namespace)
+        const result = await service.resolveSigningProvider(
+            namespace,
+            differentParticipantNamespace
+        )
 
         expect(result).not.toBeNull()
         if (result) {
@@ -184,8 +201,8 @@ describe('WalletSyncService - resolveSigningProvider', () => {
         )
 
         const mockFireblocksDriver = {
-            controller: jest.fn().mockReturnValue({
-                getKeys: jest
+            controller: vi.fn().mockReturnValue({
+                getKeys: vi
                     .fn<() => Promise<GetKeysResult>>()
                     .mockResolvedValue({
                         keys: [
@@ -204,7 +221,6 @@ describe('WalletSyncService - resolveSigningProvider', () => {
         const serviceWithFireblocks = new TestableWalletSyncService(
             store,
             ledgerClient,
-            ledgerClient,
             authContext,
             mockLogger,
             {
@@ -213,12 +229,12 @@ describe('WalletSyncService - resolveSigningProvider', () => {
             partyAllocator
         )
 
-        mockLedgerGet.mockResolvedValueOnce({
-            participantId: 'participant1::different-participant-namespace',
-        })
+        const differentParticipantNamespace = 'different-participant-namespace'
 
-        const result =
-            await serviceWithFireblocks.resolveSigningProvider(namespace)
+        const result = await serviceWithFireblocks.resolveSigningProvider(
+            namespace,
+            differentParticipantNamespace
+        )
 
         expect(result).not.toBeNull()
         if (result) {
@@ -229,13 +245,14 @@ describe('WalletSyncService - resolveSigningProvider', () => {
         }
     })
 
-    it('returns unmatched na defaults ot participant when no signing provider match is found', async () => {
+    it('returns unmatched and defaults to participant when no signing provider match is found', async () => {
         const unknownNamespace = 'unknown-namespace-123'
-        mockLedgerGet.mockResolvedValueOnce({
-            participantId: 'participant1::different-participant-namespace',
-        })
+        const differentParticipantNamespace = 'different-participant-namespace'
 
-        const result = await service.resolveSigningProvider(unknownNamespace)
+        const result = await service.resolveSigningProvider(
+            unknownNamespace,
+            differentParticipantNamespace
+        )
 
         expect(result).toEqual({
             matched: false,
@@ -253,8 +270,8 @@ describe('WalletSyncService - multi-network features', () => {
     let mockLogger: Logger
     let store: StoreInternal
     let mockLedgerClient: LedgerClient
-    let mockAdminLedgerClient: LedgerClient
     let partyAllocator: PartyAllocationService
+    let service: WalletSyncService
     const createNetwork = (id: string): Network => ({
         id,
         name: `Network ${id}`,
@@ -273,17 +290,19 @@ describe('WalletSyncService - multi-network features', () => {
     const createWallet = (
         partyId: string,
         networkId: string,
-        disabled = false
+        disabled = false,
+        status: WalletStatus = 'allocated'
     ): Wallet => ({
         primary: false,
         partyId,
-        status: 'allocated',
+        status,
         hint: partyId.split('::')[0],
         signingProviderId: 'internal',
         publicKey: 'publicKey',
         namespace: 'namespace',
         networkId,
         disabled,
+        rights: [PartyLevelRight.CanActAs],
     })
 
     const setSession = async (networkId: string) => {
@@ -325,10 +344,7 @@ describe('WalletSyncService - multi-network features', () => {
 
         partyAllocator = new PartyAllocationService({
             synchronizerId: 'test-sync-id',
-            accessTokenProvider: {
-                getUserAccessToken: async () => 'user.jwt',
-                getAdminAccessToken: async () => 'admin.jwt',
-            },
+            accessTokenProvider: testATP('admin', 'admin.jwt'),
             httpLedgerUrl: 'http://test',
             logger: mockLogger,
         })
@@ -337,24 +353,21 @@ describe('WalletSyncService - multi-network features', () => {
         mockLedgerClient = new ledgerModule.LedgerClient({
             baseUrl: new URL('http://test'),
             logger: mockLogger,
-            accessTokenProvider: {
-                getUserAccessToken: async () => 'token',
-                getAdminAccessToken: async () => 'token',
-            },
+            accessTokenProvider: testATP('token', 'token'),
         })
-        mockAdminLedgerClient = new ledgerModule.LedgerClient({
-            baseUrl: new URL('http://test'),
-            logger: mockLogger,
-            isAdmin: true,
-            accessTokenProvider: {
-                getUserAccessToken: async () => 'token',
-                getAdminAccessToken: async () => 'token',
-            },
-        })
+
+        service = new WalletSyncService(
+            store,
+            mockLedgerClient,
+            authContext,
+            mockLogger,
+            {},
+            partyAllocator
+        )
     })
 
     afterEach(() => {
-        jest.restoreAllMocks()
+        vi.restoreAllMocks()
         mockLedgerGet.mockClear()
     })
 
@@ -378,16 +391,6 @@ describe('WalletSyncService - multi-network features', () => {
                 },
             ],
         })
-
-        const service = new WalletSyncService(
-            store,
-            mockLedgerClient,
-            mockAdminLedgerClient,
-            authContext,
-            mockLogger,
-            {},
-            partyAllocator
-        )
 
         const syncNeeded = await service.isWalletSyncNeeded()
 
@@ -414,16 +417,6 @@ describe('WalletSyncService - multi-network features', () => {
             ],
         })
 
-        const service = new WalletSyncService(
-            store,
-            mockLedgerClient,
-            mockAdminLedgerClient,
-            authContext,
-            mockLogger,
-            {},
-            partyAllocator
-        )
-
         const syncNeeded = await service.isWalletSyncNeeded()
 
         // Should return true because party1 exists on ledger but not in store for network1
@@ -435,9 +428,12 @@ describe('WalletSyncService - multi-network features', () => {
         await store.addNetwork(network1)
         await setSession('network1')
         await store.addWallet(createWallet('party1::namespace', 'network1'))
-        const addWalletSpy = jest.spyOn(store, 'addWallet')
+        const addWalletSpy = vi.spyOn(store, 'addWallet')
 
         mockLedgerGet
+            .mockResolvedValueOnce({
+                participantId: 'participant1::namespace',
+            })
             .mockResolvedValueOnce({
                 rights: [
                     {
@@ -460,19 +456,6 @@ describe('WalletSyncService - multi-network features', () => {
                     },
                 ],
             })
-            .mockResolvedValueOnce({
-                participantId: 'participant1::namespace',
-            })
-
-        const service = new WalletSyncService(
-            store,
-            mockLedgerClient,
-            mockAdminLedgerClient,
-            authContext,
-            mockLogger,
-            {},
-            partyAllocator
-        )
 
         await service.syncWallets()
 
@@ -492,6 +475,9 @@ describe('WalletSyncService - multi-network features', () => {
         // Mock ledger client to return rights for party1
         mockLedgerGet
             .mockResolvedValueOnce({
+                participantId: 'participant1::namespace',
+            })
+            .mockResolvedValueOnce({
                 rights: [
                     {
                         kind: {
@@ -504,19 +490,6 @@ describe('WalletSyncService - multi-network features', () => {
                     },
                 ],
             })
-            .mockResolvedValueOnce({
-                participantId: 'participant1::namespace',
-            })
-
-        const service = new WalletSyncService(
-            store,
-            mockLedgerClient,
-            mockAdminLedgerClient,
-            authContext,
-            mockLogger,
-            {},
-            partyAllocator
-        )
 
         await service.syncWallets()
 
@@ -534,16 +507,6 @@ describe('WalletSyncService - multi-network features', () => {
         await store.addNetwork(network2)
 
         await store.addWallet(createWallet('party1::namespace', 'network1'))
-
-        const service = new WalletSyncService(
-            store,
-            mockLedgerClient,
-            mockAdminLedgerClient,
-            authContext,
-            mockLogger,
-            {},
-            partyAllocator
-        )
 
         // Mock ledger client to return rights for party1 (multi-hosted party) for network1 check
         mockLedgerGet.mockResolvedValueOnce({
@@ -596,32 +559,27 @@ describe('WalletSyncService - multi-network features', () => {
         await setSession('network1')
         await store.addWallet(createWallet('party1::namespace', 'network1'))
 
-        const service = new WalletSyncService(
-            store,
-            mockLedgerClient,
-            mockAdminLedgerClient,
-            authContext,
-            mockLogger,
-            {},
-            partyAllocator
-        )
-
         // Sync on network1 (party already exists, should not add)
         await setSession('network1')
         // Only need one mock since resolveSigningProvider won't be called if party already exists
-        mockLedgerGet.mockResolvedValueOnce({
-            rights: [
-                {
-                    kind: {
-                        CanActAs: {
-                            value: {
-                                party: 'party1::namespace',
+
+        mockLedgerGet
+            .mockResolvedValueOnce({
+                participantId: 'participant1::namespace',
+            })
+            .mockResolvedValueOnce({
+                rights: [
+                    {
+                        kind: {
+                            CanActAs: {
+                                value: {
+                                    party: 'party1::namespace',
+                                },
                             },
                         },
                     },
-                },
-            ],
-        })
+                ],
+            })
         const syncResult1 = await service.syncWallets()
         expect(syncResult1.added.length).toBe(0) // Should not add, already exists
 
@@ -635,7 +593,11 @@ describe('WalletSyncService - multi-network features', () => {
         expect(walletsBeforeSync.length).toBe(0)
 
         mockLedgerGet.mockClear()
-        // First mock: getPartiesRightsMap calls ledgerClient.getWithRetry('/v2/users/{user-id}/rights')
+        // First mock: resolveSigningProvider calls ledgerClient.getWithRetry('/v2/parties/participant-id')
+        mockLedgerGet.mockResolvedValueOnce({
+            participantId: 'participant1::namespace',
+        })
+        // Second mock: getPartiesRightsMap calls ledgerClient.getWithRetry('/v2/users/{user-id}/rights')
         mockLedgerGet.mockResolvedValueOnce({
             rights: [
                 {
@@ -648,10 +610,6 @@ describe('WalletSyncService - multi-network features', () => {
                     },
                 },
             ],
-        })
-        // Second mock: resolveSigningProvider calls adminLedgerClient.getWithRetry('/v2/parties/participant-id')
-        mockLedgerGet.mockResolvedValueOnce({
-            participantId: 'participant1::namespace',
         })
 
         expect(mockLedgerGet).toHaveBeenCalledTimes(0)
@@ -674,28 +632,503 @@ describe('WalletSyncService - multi-network features', () => {
         expect(party1Wallet?.disabled).toBe(false)
     })
 
-    // TODO maybe now that we never block sync button don't consider disabled wallet as sync is needed?
-    it('isWalletSyncNeeded should return true when disabled wallets exist', async () => {
-        const network1 = createNetwork('network1')
-        await store.addNetwork(network1)
-        await setSession('network1')
-        await store.addWallet(
-            createWallet('party1::namespace', 'network1', true)
-        )
+    describe('Wallet sync - handling wallet not having a party', () => {
+        // When party is not on ledger (e.g. after participant reset), sync marks wallet
+        // status as 'initialized' so the user can manually re-allocate each one with "Allocate" button
 
-        const service = new WalletSyncService(
-            store,
-            mockLedgerClient,
-            mockAdminLedgerClient,
-            authContext,
-            mockLogger,
-            {},
-            partyAllocator
-        )
+        it('isWalletSyncNeeded should return true when allocated wallet exists but has no party', async () => {
+            const network1 = createNetwork('network1')
+            await store.addNetwork(network1)
+            await setSession('network1')
+            await store.addWallet(
+                createWallet(
+                    'party1::namespace',
+                    'network1',
+                    undefined,
+                    'allocated'
+                )
+            )
+            await store.addWallet(
+                createWallet(
+                    'party2::namespace',
+                    'network1',
+                    undefined,
+                    'allocated'
+                )
+            )
 
-        const syncNeeded = await service.isWalletSyncNeeded()
+            mockLedgerGet.mockResolvedValueOnce({
+                rights: [
+                    {
+                        kind: {
+                            CanActAs: {
+                                value: {
+                                    party: 'party2::namespace',
+                                },
+                            },
+                        },
+                    },
+                ],
+            })
 
-        // Should return true because there's a disabled wallet
-        expect(syncNeeded).toBe(true)
+            const syncNeeded = await service.isWalletSyncNeeded()
+
+            expect(syncNeeded).toBe(true)
+        })
+
+        it('isWalletSyncNeeded should return false when initialized wallet exists and has no party', async () => {
+            const network1 = createNetwork('network1')
+            await store.addNetwork(network1)
+            await setSession('network1')
+            await store.addWallet(
+                createWallet(
+                    'party1::namespace',
+                    'network1',
+                    undefined,
+                    'initialized'
+                )
+            )
+            await store.addWallet(
+                createWallet(
+                    'party2::namespace',
+                    'network1',
+                    undefined,
+                    'allocated'
+                )
+            )
+
+            mockLedgerGet.mockResolvedValueOnce({
+                rights: [
+                    {
+                        kind: {
+                            CanActAs: {
+                                value: {
+                                    party: 'party2::namespace',
+                                },
+                            },
+                        },
+                    },
+                ],
+            })
+
+            const syncNeeded = await service.isWalletSyncNeeded()
+
+            expect(syncNeeded).toBe(false)
+        })
+
+        it('syncWallets marks allocated wallet as initialized when party not on ledger', async () => {
+            const network1 = createNetwork('network1')
+            await store.addNetwork(network1)
+            await setSession('network1')
+            await store.addWallet(createWallet('party1::namespace', 'network1'))
+
+            mockLedgerGet
+                .mockResolvedValueOnce({
+                    participantId: 'participant1::namespace',
+                })
+                .mockResolvedValueOnce({
+                    rights: [
+                        {
+                            kind: {
+                                CanActAs: {
+                                    value: { party: 'party2::namespace' },
+                                },
+                            },
+                        },
+                    ],
+                })
+
+            const updateWalletSpy = vi.spyOn(store, 'updateWallet')
+
+            const result = await service.syncWallets()
+
+            expect(updateWalletSpy).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    partyId: 'party1::namespace',
+                    networkId: 'network1',
+                    status: 'initialized',
+                })
+            )
+            const wallets = await store.getWallets()
+            const party1Wallet = wallets.find(
+                (w) => w.partyId === 'party1::namespace'
+            )
+            expect(party1Wallet?.status).toBe('initialized')
+            expect(result.added.length).toBe(1)
+            expect(result.updated.length).toBe(1)
+            expect(result.disabled.length).toBe(0)
+            expect(result.added[0].partyId).toBe('party2::namespace')
+            expect(result.updated[0].partyId).toBe('party1::namespace')
+        })
+
+        it('syncWallets skips wallet when status is already initialized', async () => {
+            const network1 = createNetwork('network1')
+            await store.addNetwork(network1)
+            await setSession('network1')
+            const initializedWallet = createWallet(
+                'party1::namespace',
+                'network1'
+            )
+            initializedWallet.status = 'initialized'
+            await store.addWallet(initializedWallet)
+
+            mockLedgerGet
+                .mockResolvedValueOnce({
+                    participantId: 'participant1::namespace',
+                })
+                .mockResolvedValueOnce({
+                    rights: [
+                        {
+                            kind: {
+                                CanActAs: {
+                                    value: { party: 'party2::namespace' },
+                                },
+                            },
+                        },
+                    ],
+                })
+
+            const updateWalletSpy = vi.spyOn(store, 'updateWallet')
+
+            const result = await service.syncWallets()
+
+            expect(updateWalletSpy).not.toHaveBeenCalled()
+            const wallets = await store.getWallets()
+            const party1Wallet = wallets.find(
+                (w) => w.partyId === 'party1::namespace'
+            )
+            expect(party1Wallet?.status).toBe('initialized')
+            expect(result.added.length).toBe(1)
+            expect(result.disabled.length).toBe(0)
+            expect(result.updated.length).toBe(0)
+            expect(result.added[0].partyId).toBe('party2::namespace')
+        })
+
+        it('syncWallets marks multiple wallets as initialized when parties not on ledger', async () => {
+            const network1 = createNetwork('network1')
+            await store.addNetwork(network1)
+            await setSession('network1')
+            await store.addWallet(createWallet('party1::namespace', 'network1'))
+            await store.addWallet(createWallet('party2::namespace', 'network1'))
+
+            mockLedgerGet
+                .mockResolvedValueOnce({
+                    participantId: 'participant1::namespace',
+                })
+                .mockResolvedValueOnce({
+                    rights: [
+                        {
+                            kind: {
+                                CanActAs: {
+                                    value: { party: 'party3::namespace' },
+                                },
+                            },
+                        },
+                    ],
+                })
+
+            const updateWalletSpy = vi.spyOn(store, 'updateWallet')
+
+            const result = await service.syncWallets()
+
+            expect(updateWalletSpy).toHaveBeenCalledTimes(2)
+            expect(updateWalletSpy).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    partyId: 'party1::namespace',
+                    networkId: 'network1',
+                    status: 'initialized',
+                })
+            )
+            expect(updateWalletSpy).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    partyId: 'party2::namespace',
+                    networkId: 'network1',
+                    status: 'initialized',
+                })
+            )
+            expect(result.added.length).toBe(1)
+            expect(result.disabled.length).toBe(0)
+            expect(result.updated.length).toBe(2)
+            expect(result.added[0].partyId).toBe('party3::namespace')
+        })
+
+        it('syncWallets disables participant wallet when party not on ledger', async () => {
+            const network1 = createNetwork('network1')
+            await store.addNetwork(network1)
+            await setSession('network1')
+            const participantWallet = createWallet(
+                'party1::namespace',
+                'network1'
+            )
+            participantWallet.signingProviderId = SigningProvider.PARTICIPANT
+            await store.addWallet(participantWallet)
+
+            mockLedgerGet
+                .mockResolvedValueOnce({
+                    participantId: 'participant1::namespace',
+                })
+                .mockResolvedValueOnce({
+                    rights: [
+                        {
+                            kind: {
+                                CanActAs: {
+                                    value: { party: 'party2::namespace' },
+                                },
+                            },
+                        },
+                    ],
+                })
+
+            const updateWalletSpy = vi.spyOn(store, 'updateWallet')
+
+            const result = await service.syncWallets()
+
+            expect(updateWalletSpy).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    partyId: 'party1::namespace',
+                    networkId: 'network1',
+                    disabled: true,
+                    reason: 'participant namespace changed',
+                })
+            )
+            const wallets = await store.getWallets()
+            const party1Wallet = wallets.find(
+                (w) => w.partyId === 'party1::namespace'
+            )
+            expect(party1Wallet?.disabled).toBe(true)
+            expect(party1Wallet?.reason).toBe('participant namespace changed')
+            expect(result.added.length).toBe(1)
+            expect(result.updated.length).toBe(0)
+            expect(result.disabled.length).toBe(1)
+            expect(result.added[0].partyId).toBe('party2::namespace')
+            expect(result.disabled[0].partyId).toBe('party1::namespace')
+        })
+
+        it('syncWallets reports proper changes while adding a wallet when there are disabled wallets', async () => {
+            const network1 = createNetwork('network1')
+            await store.addNetwork(network1)
+            await setSession('network1')
+            const disabledWallet = createWallet(
+                'party1::namespace',
+                'network1',
+                true
+            )
+            await store.addWallet(disabledWallet)
+
+            mockLedgerGet
+                .mockResolvedValueOnce({
+                    participantId: 'participant1::namespace',
+                })
+                .mockResolvedValueOnce({
+                    rights: [
+                        {
+                            kind: {
+                                CanActAs: {
+                                    value: { party: 'party2::namespace' },
+                                },
+                            },
+                        },
+                    ],
+                })
+
+            const updateWalletSpy = vi.spyOn(store, 'updateWallet')
+            const addWalletSpy = vi.spyOn(store, 'addWallet')
+
+            const result = await service.syncWallets()
+
+            expect(updateWalletSpy).not.toHaveBeenCalled()
+            expect(addWalletSpy).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    partyId: 'party2::namespace',
+                    networkId: 'network1',
+                    disabled: false,
+                })
+            )
+            const wallets = await store.getWallets()
+            const party1Wallet = wallets.find(
+                (w) => w.partyId === 'party1::namespace'
+            )
+            expect(party1Wallet?.disabled).toBe(true)
+            expect(result.added.length).toBe(1)
+            expect(result.updated.length).toBe(0)
+            expect(result.disabled.length).toBe(0)
+            expect(result.added[0].partyId).toBe('party2::namespace')
+        })
+
+        it('syncWallets reports proper changes while adding a disabled wallet when there are disabled wallets', async () => {
+            const network1 = createNetwork('network1')
+            await store.addNetwork(network1)
+            await setSession('network1')
+            const disabledWallet = createWallet(
+                'party1::unknown-namespace-123',
+                'network1',
+                true
+            )
+            await store.addWallet(disabledWallet)
+
+            mockLedgerGet
+                .mockResolvedValueOnce({
+                    participantId: 'participant1::namespace',
+                })
+                .mockResolvedValueOnce({
+                    rights: [
+                        {
+                            kind: {
+                                CanActAs: {
+                                    value: {
+                                        party: 'party2::unknown-namespace-123',
+                                    },
+                                },
+                            },
+                        },
+                    ],
+                })
+
+            const updateWalletSpy = vi.spyOn(store, 'updateWallet')
+            const addWalletSpy = vi.spyOn(store, 'addWallet')
+
+            const result = await service.syncWallets()
+
+            expect(updateWalletSpy).not.toHaveBeenCalled()
+            expect(addWalletSpy).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    partyId: 'party2::unknown-namespace-123',
+                    networkId: 'network1',
+                    disabled: true,
+                    reason: WALLET_DISABLED_REASON.NO_SIGNING_PROVIDER_MATCHED,
+                })
+            )
+            const wallets = await store.getWallets()
+            const party1Wallet = wallets.find(
+                (w) => w.partyId === 'party2::unknown-namespace-123'
+            )
+            expect(party1Wallet?.disabled).toBe(true)
+            expect(party1Wallet?.reason).toBe(
+                WALLET_DISABLED_REASON.NO_SIGNING_PROVIDER_MATCHED
+            )
+            expect(result.added.length).toBe(0)
+            expect(result.updated.length).toBe(0)
+            expect(result.disabled.length).toBe(1)
+            expect(result.disabled[0].partyId).toBe(
+                'party2::unknown-namespace-123'
+            )
+        })
+    })
+
+    describe('Wallet sync - rights tracking', () => {
+        it('isWalletSyncNeeded should return true when wallet rights changed on ledger', async () => {
+            const network1 = createNetwork('network1')
+            await store.addNetwork(network1)
+            await setSession('network1')
+            await store.addWallet({
+                ...createWallet('party1::namespace', 'network1'),
+                rights: [PartyLevelRight.CanActAs],
+            })
+
+            mockLedgerGet.mockResolvedValueOnce({
+                rights: [
+                    {
+                        kind: {
+                            CanReadAs: {
+                                value: {
+                                    party: 'party1::namespace',
+                                },
+                            },
+                        },
+                    },
+                ],
+            })
+
+            const syncNeeded = await service.isWalletSyncNeeded()
+            expect(syncNeeded).toBe(true)
+        })
+
+        it('syncWallets updates rights when they changed on ledger', async () => {
+            const network1 = createNetwork('network1')
+            await store.addNetwork(network1)
+            await setSession('network1')
+            await store.addWallet({
+                ...createWallet('party1::namespace', 'network1'),
+                rights: [PartyLevelRight.CanActAs],
+            })
+            await store.addWallet({
+                ...createWallet('party3::namespace', 'network1'),
+                rights: [PartyLevelRight.CanActAs],
+            })
+
+            mockLedgerGet
+                .mockResolvedValueOnce({
+                    participantId: 'participant1::namespace',
+                })
+                .mockResolvedValueOnce({
+                    rights: [
+                        {
+                            kind: {
+                                CanReadAs: {
+                                    value: {
+                                        party: 'party1::namespace',
+                                    },
+                                },
+                            },
+                        },
+                        {
+                            kind: {
+                                CanActAs: {
+                                    value: {
+                                        party: 'party2::namespace',
+                                    },
+                                },
+                            },
+                        },
+                    ],
+                })
+
+            const result = await service.syncWallets()
+
+            expect(result.updated).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({
+                        partyId: 'party1::namespace',
+                        rights: [PartyLevelRight.CanReadAs],
+                    }),
+                ])
+            )
+            const wallets = await store.getWallets()
+            const updatedWallet = wallets.find(
+                (w) => w.partyId === 'party1::namespace'
+            )
+            expect(updatedWallet?.rights).toEqual([PartyLevelRight.CanReadAs])
+            // party2 wallet added
+            expect(result.added.length).toBe(1)
+            // party1 wallet updated rights
+            // party3 wallet updated to initialized (no rights)
+            expect(result.updated.length).toBe(2)
+        })
+
+        it('syncWallets does not create wallets from CanReadAsAnyParty alone', async () => {
+            const network1 = createNetwork('network1')
+            await store.addNetwork(network1)
+            await setSession('network1')
+
+            mockLedgerGet
+                .mockResolvedValueOnce({
+                    participantId: 'participant1::namespace',
+                })
+                .mockResolvedValueOnce({
+                    rights: [
+                        {
+                            kind: {
+                                CanReadAsAnyParty: {
+                                    value: {},
+                                },
+                            },
+                        },
+                    ],
+                })
+
+            const result = await service.syncWallets()
+            expect(result.added).toHaveLength(0)
+            expect((await store.getWallets()).length).toBe(0)
+        })
     })
 })

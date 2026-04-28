@@ -6,20 +6,18 @@ import { usePrimaryAccount } from '../hooks/useAccounts'
 
 export const ConnectionCard: React.FC = () => {
     const { error, status, connect, open, disconnect } = useConnection()
-    const connected = status?.isConnected
+    const connected = status?.connection?.isConnected
     const primaryParty = usePrimaryAccount()?.partyId
 
     return (
         <div className="card">
             {!connected && (
-                <button onClick={() => connect()}>
-                    connect to Wallet Gateway
-                </button>
+                <button onClick={() => connect()}>connect to Wallet</button>
             )}
             {connected && (
                 <button onClick={() => disconnect()}>disconnect</button>
             )}
-            <button onClick={() => open()}>open Wallet Gateway</button>
+            <button onClick={() => open()}>open Wallet</button>
             {error && (
                 <p className="error">
                     <b>Error:</b> <i>{error}</i>

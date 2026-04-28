@@ -4,8 +4,15 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import * as sdk from '@canton-network/dapp-sdk'
+import { WalletConnectAdapter } from '@canton-network/dapp-sdk'
 import { queryKeys } from '../hooks/query-keys'
 import { ConnectionContext } from './ConnectionContext'
+
+const wcProjectId = import.meta.env.VITE_WC_PROJECT_ID as string
+const wcAdapter = wcProjectId
+    ? WalletConnectAdapter.create({ projectId: wcProjectId })
+    : undefined
+const additionalAdapters = wcAdapter ? [wcAdapter] : []
 
 export const ConnectionProvider: React.FC<{ children: React.ReactNode }> = ({
     children,
@@ -19,6 +26,7 @@ export const ConnectionProvider: React.FC<{ children: React.ReactNode }> = ({
 
     const connect = useCallback(() => {
         sdk.connect()
+            .then(() => sdk.status())
             .then((status) => {
                 setConnectionStatus(status)
                 setAccounts([])
@@ -32,36 +40,69 @@ export const ConnectionProvider: React.FC<{ children: React.ReactNode }> = ({
 
     const open = useCallback(() => sdk.open(), [])
 
-    const disconnect = useCallback(() => {
-        sdk.disconnect().then(() => {
-            setConnectionStatus(undefined)
-            setAccounts([])
-            setError(undefined)
-        })
+    const doDisconnect = useCallback(() => {
+        setConnectionStatus(undefined)
+        setAccounts([])
+        setError(undefined)
+        sdk.disconnect().catch(() => {})
     }, [])
 
-    // First effect: fetch status on mount
-    useEffect(() => {
-        const provider = window.canton
-        if (!provider) return
-        provider
-            .request<sdk.dappAPI.StatusEvent>({ method: 'status' })
-            .then((status) => setConnectionStatus(status))
-            .catch((reason) => setError(`failed to get status: ${reason}`))
+    const disconnect = useCallback(() => {
+        doDisconnect()
+    }, [doDisconnect])
 
-        // Listen for connected events from the provider
-        const onStatusChanged = (status: sdk.dappAPI.StatusEvent) =>
-            setConnectionStatus(status)
-        provider.on<sdk.dappAPI.StatusEvent>('statusChanged', onStatusChanged)
+    useEffect(() => {
+        let active = true
+
+        sdk.init({ additionalAdapters })
+            .then(() => sdk.status())
+            .then((status) => {
+                if (active) {
+                    setConnectionStatus(status)
+                    setError(undefined)
+                }
+            })
+            .catch((reason) => {
+                const message =
+                    reason instanceof Error ? reason.message : String(reason)
+
+                if (message.includes('Not connected')) {
+                    return
+                }
+
+                if (active) {
+                    setError(`failed to get status: ${message}`)
+                }
+            })
+
         return () => {
-            provider.removeListener('statusChanged', onStatusChanged)
+            active = false
         }
     }, [])
+
+    // Listen for status changes when connected (re-registers after each connect/disconnect)
+    useEffect(() => {
+        if (!connectionStatus?.connection?.isConnected) return
+
+        const onStatusChanged = (status: sdk.dappAPI.StatusEvent) => {
+            if (!status.connection?.isConnected) {
+                doDisconnect()
+                return
+            }
+            setConnectionStatus(status)
+        }
+
+        sdk.onStatusChanged(onStatusChanged)
+
+        return () => {
+            void sdk.removeOnStatusChanged(onStatusChanged)
+        }
+    }, [connectionStatus?.connection?.isConnected, doDisconnect])
 
     // Second effect: request accounts only when connected
     useEffect(() => {
         const provider = window.canton
-        if (!provider || !connectionStatus?.isConnected) return
+        if (!provider || !connectionStatus?.connection?.isConnected) return
         provider
             .request({
                 method: 'listAccounts',
@@ -99,7 +140,7 @@ export const ConnectionProvider: React.FC<{ children: React.ReactNode }> = ({
             provider.removeListener('txChanged', messageListener)
             provider.removeListener('accountsChanged', onAccountsChanged)
         }
-    }, [connectionStatus?.isConnected, queryClient])
+    }, [connectionStatus?.connection?.isConnected, queryClient])
 
     return (
         <ConnectionContext.Provider

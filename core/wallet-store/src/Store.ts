@@ -28,14 +28,30 @@ export interface WalletFilter {
 
 export type CurrentNetworkWalletFilter = Omit<WalletFilter, 'networkIds'>
 
-export interface UpdateWallet {
-    status: WalletStatus
-    partyId: PartyId
-    networkId?: string
-    externalTxId: string
+export enum PartyLevelRight {
+    CanActAs = 'CanActAs',
+    CanReadAs = 'CanReadAs',
+    CanExecuteAs = 'CanExecuteAs',
 }
 
-export type WalletStatus = 'initialized' | 'allocated'
+export enum UserLevelRight {
+    CanReadAsAnyParty = 'CanReadAsAnyParty',
+    CanExecuteAsAnyParty = 'CanExecuteAsAnyParty',
+}
+
+export interface UpdateWallet {
+    partyId: PartyId
+    networkId?: string
+    status?: WalletStatus
+    externalTxId?: string
+    topologyTransactions?: string
+    disabled?: boolean
+    reason?: string
+    primary?: boolean
+    rights?: PartyLevelRight[]
+}
+
+export type WalletStatus = 'initialized' | 'allocated' | 'removed'
 
 export interface Wallet {
     primary: boolean
@@ -50,6 +66,7 @@ export interface Wallet {
     topologyTransactions?: string
     disabled?: boolean
     reason?: string
+    rights: PartyLevelRight[]
     // hosted: [network]
 }
 
@@ -62,6 +79,7 @@ export interface Session {
 }
 
 export interface Transaction {
+    id: string
     status: 'pending' | 'signed' | 'executed' | 'failed'
     commandId: string
     preparedTransaction: string
@@ -70,6 +88,13 @@ export interface Transaction {
     origin: string | null
     createdAt?: Date
     signedAt?: Date
+    externalTxId?: string
+}
+
+export interface TransactionStatusUpdate {
+    payload?: unknown
+    signedAt?: Date
+    externalTxId?: string
 }
 
 // Store interface for managing wallets, sessions, networks, and transactions
@@ -83,6 +108,11 @@ export interface Store {
     addWallet(wallet: Wallet): Promise<void>
     updateWallet(params: UpdateWallet): Promise<void>
     removeWallet(partyId: PartyId): Promise<void>
+    getUserRights(networkId?: string): Promise<Array<UserLevelRight>>
+    setUserRights(
+        networkId: string,
+        rights: Array<UserLevelRight>
+    ): Promise<void>
 
     // Session methods
     getSession(): Promise<Session | undefined>
@@ -106,6 +136,20 @@ export interface Store {
 
     // Transaction methods
     setTransaction(tx: Transaction): Promise<void>
-    getTransaction(commandId: string): Promise<Transaction | undefined>
+    setTransactionSigned(
+        transactionId: string,
+        signedAt: Date,
+        externalTxId?: string
+    ): Promise<void>
+    setTransactionStatus(
+        transactionId: string,
+        status: Transaction['status'],
+        updates?: TransactionStatusUpdate
+    ): Promise<void>
+    getTransaction(transactionId: string): Promise<Transaction | undefined>
+    getLatestTransactionByCommandId(
+        commandId: string
+    ): Promise<Transaction | undefined>
     listTransactions(): Promise<Array<Transaction>>
+    removeTransaction(transactionId: string): Promise<void>
 }

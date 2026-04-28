@@ -3,26 +3,38 @@
 
 import { useEffect, useState } from 'react'
 import * as sdk from '@canton-network/dapp-sdk'
+import { WalletConnectAdapter } from '@canton-network/dapp-sdk'
 import { handleErrorToast } from '@canton-network/core-wallet-ui-components'
+import { LoopAdapter } from '@canton-network/sdk-support-provider-adapter-loop'
+
+const loopAdapter = new LoopAdapter({
+    name: '5N Loop Wallet (Devnet)',
+    network: 'devnet',
+})
+
+const wcProjectId = import.meta.env.VITE_WC_PROJECT_ID as string
+const wcAdapter = wcProjectId
+    ? WalletConnectAdapter.create({ projectId: wcProjectId })
+    : undefined
+
+const additionalAdapters = wcAdapter ? [loopAdapter, wcAdapter] : [loopAdapter]
 
 /**
  * React hook that manages the connection to the wallet gateway.
  * Uses the dapp-sdk to connect and disconnect, and updates the connection status.
- *
- * @returns { connect, disconnect, status }
  */
 export function useConnect(): {
     connect: () => Promise<void>
     disconnect: () => Promise<void>
-    status?: sdk.dappAPI.StatusEvent
+    connectResult?: sdk.dappAPI.ConnectResult
 } {
-    const [status, setStatus] = useState<sdk.dappAPI.StatusEvent>()
+    const [connectResult, setConnectResult] =
+        useState<sdk.dappAPI.ConnectResult>()
 
     async function connect() {
-        sdk.connect()
-            .then((status) => {
-                setStatus(status)
-            })
+        await sdk
+            .connect()
+            .then(setConnectResult)
             .catch((err) => {
                 console.error('Error connecting to wallet:', err)
                 handleErrorToast(err)
@@ -31,42 +43,46 @@ export function useConnect(): {
     }
 
     async function disconnect() {
-        sdk.disconnect().then(() => {
-            setStatus(undefined)
-        })
+        try {
+            await sdk.disconnect()
+        } catch (err) {
+            console.warn('Error during disconnect:', err)
+        }
+        setConnectResult(undefined)
     }
 
     useEffect(() => {
-        sdk.status()
-            .then(setStatus)
+        sdk.init({ additionalAdapters })
+            .then(() => sdk.status())
+            .then((s) => setConnectResult(s.connection))
             .catch(() => {
-                setStatus(undefined)
+                setConnectResult(undefined)
             })
     }, [])
 
     useEffect(() => {
-        if (status?.isConnected) {
+        if (connectResult?.isConnected) {
             console.debug('[use-connect] Adding status changed listener')
             const onStatusChanged = (status: sdk.dappAPI.StatusEvent) => {
                 console.debug(
                     '[use-connect] Received status changed event:',
                     status
                 )
-                setStatus(status)
+                setConnectResult(status.connection)
             }
 
             sdk.onStatusChanged(onStatusChanged)
 
             return () => {
-                console.debug('[use-connect] Removing status changed listener')
+                console.debug('[use-connect] Removing connect changed listener')
                 sdk.removeOnStatusChanged(onStatusChanged)
             }
         }
-    }, [status])
+    }, [connectResult])
 
     return {
         connect,
         disconnect,
-        status,
+        connectResult,
     }
 }

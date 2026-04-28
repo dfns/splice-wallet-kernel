@@ -1,370 +1,220 @@
 // Copyright (c) 2025-2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { html, css, LitElement, nothing } from 'lit'
+import { html } from 'lit'
 import { customElement, state } from 'lit/decorators.js'
-import '@canton-network/core-wallet-ui-components'
-import { handleErrorToast } from '@canton-network/core-wallet-ui-components'
-import { createUserClient } from '../rpc-client'
 import {
-    ExecuteParams,
-    SignParams,
-} from '@canton-network/core-wallet-user-rpc-client'
+    BaseElement,
+    handleErrorToast,
+    toRelHref,
+} from '@canton-network/core-wallet-ui-components'
+import {
+    ParsedTransactionInfo,
+    parsePreparedTransaction,
+} from '@canton-network/core-tx-visualizer'
+import { createUserClient } from '../rpc-client'
 import { stateManager } from '../state-manager'
 import '../index'
-import {
-    parsePreparedTransaction,
-    PreparedTransactionParsed,
-} from '../transactions/decode'
+import { ACTIVITIES_PAGE_REDIRECT } from '../constants'
+import { showToast } from '../utils'
+import { SignResult } from '@canton-network/core-wallet-user-rpc-client'
+import { PartyLevelRight } from '@canton-network/core-wallet-store'
 
 @customElement('user-ui-approve')
-export class ApproveUi extends LitElement {
-    @state() accessor loading = false
+export class ApproveUi extends BaseElement {
+    @state() accessor isApproving = false
+    @state() accessor isDeleting = false
+    @state() accessor disabled = false
+    @state() accessor transactionId = ''
     @state() accessor commandId = ''
     @state() accessor partyId = ''
     @state() accessor txHash = ''
     @state() accessor tx = ''
-    @state() accessor txParsed: PreparedTransactionParsed | null = null
+    @state() accessor txParsed: ParsedTransactionInfo | null = null
     @state() accessor status = ''
-    @state() accessor message: string | null = null
-    @state() accessor messageType: 'info' | 'error' | null = null
     @state() accessor createdAt: string | null = null
     @state() accessor signedAt: string | null = null
     @state() accessor origin: string | null = null
-
-    static styles = css`
-        :host {
-            display: block;
-            box-sizing: border-box;
-            padding: 0rem;
-            max-width: 900px;
-            margin: 0 auto;
-            font-family: var(--swk-font, Arial, sans-serif);
-            color: var(--text-color, #222);
-        }
-
-        :host([theme='dark']) {
-            --card-bg: #1e1e1e;
-            --border-color: #333;
-            --text-color: #fff;
-            --button-bg: #4caf50;
-            --button-hover: #66bb6a;
-            --message-info: #81c784;
-            --message-error: #ff6b6b;
-        }
-
-        :host(:not([theme='dark'])) {
-            --card-bg: #fff;
-            --border-color: #ddd;
-            --text-color: #222;
-            --button-bg: #4caf50;
-            --button-hover: #43a047;
-            --message-info: #388e3c;
-            --message-error: #d32f2f;
-        }
-
-        .card {
-            background: var(--card-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 1.5rem;
-            width: 100%;
-            box-sizing: border-box;
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
-            overflow-x: hidden;
-            word-break: break-word;
-            margin-top: 2rem;
-        }
-
-        h1 {
-            font-size: 1.25rem;
-            margin: 0;
-        }
-
-        h2 {
-            font-size: 1rem;
-            margin: 0.5rem 0 0.25rem 0;
-        }
-
-        h3 {
-            font-size: 0.875rem;
-            margin: 0.25rem 0;
-        }
-
-        p {
-            font-size: 0.85rem;
-            margin: 0.25rem 0;
-            word-break: break-word;
-        }
-
-        .tx-box {
-            background: rgba(0, 0, 0, 0.05);
-            border-radius: 8px;
-            padding: 0.5rem;
-            max-height: 150px;
-            overflow-y: auto;
-            overflow-x: auto;
-            font-family: monospace;
-            color: var(--text-color);
-            word-break: break-word;
-        }
-
-        .section-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .copy-btn {
-            background: transparent;
-            border: 1px solid var(--border-color);
-            padding: 0.25rem 0.5rem;
-            font-size: 0.75rem;
-            color: var(--text-color);
-            cursor: pointer;
-            border-radius: 4px;
-            transition: all 0.2s ease;
-        }
-
-        .copy-btn:hover {
-            background: var(--button-bg);
-            border-color: var(--button-bg);
-            color: white;
-        }
-
-        button {
-            padding: 0.75rem;
-            border-radius: 8px;
-            border: none;
-            cursor: pointer;
-            background: var(--button-bg);
-            color: white;
-            font-weight: 600;
-            font-size: 1rem;
-            transition: background 0.2s ease;
-        }
-
-        button:hover {
-            background: var(--button-hover);
-        }
-
-        button[disabled] {
-            opacity: 0.6;
-            cursor: not-allowed;
-        }
-
-        .message {
-            padding: 0.5rem;
-            border-radius: 6px;
-            font-size: 0.875rem;
-        }
-
-        .message.info {
-            background-color: var(--message-info);
-            color: white;
-        }
-
-        .message.error {
-            background-color: var(--message-error);
-            color: white;
-        }
-
-        @media (max-width: 480px) {
-            .card {
-                padding: 1rem;
-            }
-
-            h1 {
-                font-size: 1.1rem;
-            }
-
-            button {
-                font-size: 0.95rem;
-            }
-        }
-    `
+    @state() accessor canSubmit = true
+    @state() accessor walletCapabilityMessage: string | null = null
 
     connectedCallback(): void {
         super.connectedCallback()
         const url = new URL(window.location.href)
-        this.commandId = url.searchParams.get('commandId') || ''
-        this.updateState()
+        this.transactionId = url.searchParams.get('transactionId') || ''
+        void this.updateState()
+    }
+
+    private closeOrGoToList() {
+        // Disable action buttons while leaving the page
+        this.disabled = true
+        const params = new URLSearchParams(window.location.search)
+        // if approve view was triggered via dApp, close it after action
+        // otherwise go back to activity list
+        const shouldClose = params.has('closeafteraction')
+        setTimeout(() => {
+            if (shouldClose && window.opener) {
+                window.close()
+            } else {
+                window.location.href = toRelHref(ACTIVITIES_PAGE_REDIRECT)
+            }
+        }, 2000)
     }
 
     private async updateState() {
         const userClient = await createUserClient(
             stateManager.accessToken.get()
         )
-        userClient
-            .request('getTransaction', { commandId: this.commandId })
-            .then((result) => {
-                this.txHash = result.preparedTransactionHash
-                this.tx = result.preparedTransaction
-                this.status = result.status
-                this.createdAt = result.createdAt || null
-                this.signedAt = result.signedAt || null
-                this.origin = result.origin || null
-                try {
-                    this.txParsed = parsePreparedTransaction(this.tx)
-                } catch (error) {
-                    console.error('Error parsing prepared transaction:', error)
-                    this.txParsed = null
-                }
-            })
 
-        userClient.request('listWallets', {}).then((wallets) => {
-            this.partyId =
-                wallets.find((w) => w.primary === true)?.partyId || ''
+        const result = await userClient.request({
+            method: 'getTransaction',
+            params: { transactionId: this.transactionId },
         })
-    }
-
-    private async handleExecute() {
-        this.loading = true
-        this.message = 'Executing transaction...'
-        this.messageType = 'info'
+        this.transactionId = result.id
+        this.commandId = result.commandId
+        this.txHash = result.preparedTransactionHash
+        this.tx = result.preparedTransaction
+        this.status = result.status
+        this.createdAt = result.createdAt || null
+        this.signedAt = result.signedAt || null
+        this.origin = result.origin || null
 
         try {
-            const signRequest: SignParams = {
-                commandId: this.commandId,
-                partyId: this.partyId,
-                preparedTransactionHash: this.txHash,
-                preparedTransaction: this.tx,
-            }
+            this.txParsed = parsePreparedTransaction(this.tx)
+        } catch (error) {
+            console.error('Error parsing prepared transaction:', error)
+            this.txParsed = null
+        }
 
+        const wallets = await userClient.request({
+            method: 'listWallets',
+            params: {},
+        })
+        const primaryWallet = wallets.find((w) => w.primary === true)
+        this.partyId = primaryWallet?.partyId || ''
+        const rights = primaryWallet?.rights
+        const submitCapable = !!(
+            rights?.includes(PartyLevelRight.CanActAs) ||
+            rights?.includes(PartyLevelRight.CanExecuteAs)
+        )
+        this.canSubmit = submitCapable
+        this.walletCapabilityMessage = submitCapable
+            ? null
+            : 'The selected wallet is read-only for submission (no CanActAs/CanExecuteAs right).'
+    }
+
+    private async handleReject() {
+        if (!confirm(`Reject pending activity "${this.commandId}"?`)) {
+            return
+        }
+
+        this.isDeleting = true
+
+        try {
             const userClient = await createUserClient(
                 stateManager.accessToken.get()
             )
-            const { signature, signedBy } = await userClient.request(
-                'sign',
-                signRequest
-            )
+            await userClient.request({
+                method: 'deleteTransaction',
+                params: { transactionId: this.transactionId },
+            })
 
-            const executeRequest: ExecuteParams = {
-                signature,
-                signedBy,
-                commandId: this.commandId,
-                partyId: this.partyId,
-            }
-            await userClient.request('execute', executeRequest)
-
-            this.message = 'Transaction executed successfully ✅'
-            this.messageType = 'info'
-            // This prevents folks from clicking approve twice
-            this.status = 'executed'
-
-            if (window.opener) {
-                setTimeout(() => window.close(), 1000)
-            }
+            showToast('', 'Activity rejected successfully', 'success')
+            this.closeOrGoToList()
         } catch (err) {
             console.error(err)
-            this.message = null
-            this.messageType = null
-            handleErrorToast(err, { message: 'Error executing transaction' })
+            handleErrorToast(err, { message: 'Error rejecting activity' })
         } finally {
-            this.loading = false
+            this.isDeleting = false
+        }
+    }
+
+    private async handleApprove() {
+        if (!this.canSubmit) {
+            showToast(
+                'Read-only wallet',
+                'This wallet can read but cannot submit transactions. Switch to a wallet with CanActAs or CanExecuteAs.',
+                'error'
+            )
+            return
+        }
+        this.isApproving = true
+
+        try {
+            const userClient = await createUserClient(
+                stateManager.accessToken.get()
+            )
+            const result: SignResult = await userClient.request({
+                method: 'sign',
+                params: {
+                    transactionId: this.transactionId,
+                    partyId: this.partyId,
+                },
+            })
+
+            if (result.status === 'pending') {
+                showToast(
+                    'Activity pending',
+                    'Complete signing in your external provider, then click Approve to finish.',
+                    'info'
+                )
+                await this.updateState()
+                return
+            }
+
+            if (result.status === 'signed') {
+                await userClient.request({
+                    method: 'execute',
+                    params: {
+                        signature: result.signature,
+                        signedBy: result.signedBy,
+                        transactionId: this.transactionId,
+                        partyId: this.partyId,
+                    },
+                })
+
+                showToast('', 'Activity executed successfully', 'success')
+                this.closeOrGoToList()
+                return
+            }
+
+            const message =
+                result.status === 'rejected'
+                    ? 'Activity was rejected'
+                    : 'Activity failed'
+            showToast('', message, 'error')
+            await this.updateState()
+        } catch (err) {
+            console.error(err)
+            handleErrorToast(err, { message: 'Error executing activity' })
+        } finally {
+            this.isApproving = false
         }
     }
 
     protected render() {
         return html`
-            <div class="card">
-                <h1>Pending Transaction Request</h1>
-
-                <h2>Transaction Details</h2>
-
-                <h3>Command Id</h3>
-                <p>${this.commandId}</p>
-
-                <h3>Status</h3>
-                <p>${this.status}</p>
-
-                ${this.createdAt
-                    ? html`<h3>Created At</h3>
-                          <p>${this.createdAt}</p>`
-                    : nothing}
-                ${this.signedAt
-                    ? html`<h3>Signed At</h3>
-                          <p>${this.signedAt}</p>`
-                    : nothing}
-                ${this.origin
-                    ? html`<h3>Origin</h3>
-                          <p>${this.origin}</p>`
-                    : nothing}
-
-                <h3>Template</h3>
-                <p>
-                    ${this.txParsed?.packageName || 'N/A'}:${this.txParsed
-                        ?.moduleName || 'N/A'}:${this.txParsed?.entityName ||
-                    'N/A'}
-                </p>
-
-                <h3>Signatories</h3>
-                <ul>
-                    ${this.txParsed?.signatories?.map(
-                        (signatory) => html`<li>${signatory}</li>`
-                    ) || html`<li>N/A</li>`}
-                </ul>
-
-                <h3>Stakeholders</h3>
-                <ul>
-                    ${this.txParsed?.stakeholders?.map(
-                        (stakeholder) => html`<li>${stakeholder}</li>`
-                    ) || html`<li>N/A</li>`}
-                </ul>
-
-                <h3>Transaction Hash</h3>
-                <p>${this.txHash}</p>
-
-                <div class="section-header">
-                    <h3>Base64 Transaction</h3>
-                    <button
-                        class="copy-btn"
-                        @click=${() => this._copyToClipboard(this.tx)}
-                        title="Copy to clipboard"
-                    >
-                        📋 Copy
-                    </button>
-                </div>
-                <div class="tx-box">${this.tx}</div>
-
-                <div class="section-header">
-                    <h3>Decoded Transaction</h3>
-                    <button
-                        class="copy-btn"
-                        @click=${() =>
-                            this._copyToClipboard(
-                                this.txParsed?.jsonString || ''
-                            )}
-                        title="Copy to clipboard"
-                    >
-                        📋 Copy
-                    </button>
-                </div>
-                <div class="tx-box">${this.txParsed?.jsonString || 'N/A'}</div>
-
-                ${this.status === 'executed'
-                    ? nothing
-                    : html`
-                          <button
-                              ?disabled=${this.loading}
-                              @click=${this.handleExecute}
-                          >
-                              ${this.loading ? 'Processing...' : 'Approve'}
-                          </button>
-                      `}
-                ${this.message
-                    ? html`<div class="message ${this.messageType}">
-                          ${this.message}
-                      </div>`
-                    : null}
-            </div>
+            ${this.walletCapabilityMessage
+                ? html`<div class="alert alert-warning" role="alert">
+                      ${this.walletCapabilityMessage}
+                  </div>`
+                : ''}
+            <wg-transaction-detail
+                .commandId=${this.commandId}
+                .status=${this.status}
+                .txHash=${this.txHash}
+                .tx=${this.tx}
+                .parsed=${this.txParsed}
+                .createdAt=${this.createdAt}
+                .signedAt=${this.signedAt}
+                .origin=${this.origin}
+                .backHref=${toRelHref(ACTIVITIES_PAGE_REDIRECT)}
+                .isApproving=${this.isApproving}
+                .isDeleting=${this.isDeleting}
+                .disabled=${this.disabled}
+                @transaction-approve=${this.handleApprove}
+                @transaction-delete=${this.handleReject}
+            ></wg-transaction-detail>
         `
-    }
-
-    private _copyToClipboard(text: string) {
-        navigator.clipboard.writeText(text)
     }
 }

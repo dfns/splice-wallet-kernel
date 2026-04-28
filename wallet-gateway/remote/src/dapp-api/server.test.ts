@@ -1,7 +1,7 @@
 // Copyright (c) 2025-2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { expect, test } from '@jest/globals'
+import { expect, test } from 'vitest'
 
 import cors from 'cors'
 import request from 'supertest'
@@ -26,7 +26,7 @@ const authService: AuthService = {
 const configPath = '../test/config.json'
 const config = ConfigUtils.loadConfigFile(configPath)
 
-const store = new StoreInternal(config.store, pino(sink()))
+const store = new StoreInternal(config.bootstrap, pino(sink()))
 
 const notificationService = new NotificationService(pino(sink()))
 
@@ -60,10 +60,6 @@ test('call connect rpc', async () => {
         id: 0,
         jsonrpc: '2.0',
         result: {
-            kernel: {
-                id: 'remote-da',
-                clientType: 'remote',
-            },
             isConnected: false,
             isNetworkConnected: false,
             networkReason: 'Unauthenticated',

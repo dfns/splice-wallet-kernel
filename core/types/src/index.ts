@@ -82,20 +82,35 @@ export enum WalletEvent {
 
 export type SpliceMessageEvent = MessageEvent<SpliceMessage>
 
+const SpliceTarget = z
+    .string()
+    .min(1)
+    .describe(
+        'Optional routing key for browser-extension messaging. When present, only the matching extension should handle the message.'
+    )
+
 export const SpliceMessage = z.discriminatedUnion('type', [
     z.object({
         type: z.literal(WalletEvent.SPLICE_WALLET_REQUEST),
         request: JsonRpcRequest,
+        target: SpliceTarget.optional(),
     }),
     z.object({
         type: z.literal(WalletEvent.SPLICE_WALLET_RESPONSE),
         response: JsonRpcResponse,
     }),
-    z.object({ type: z.literal(WalletEvent.SPLICE_WALLET_EXT_READY) }),
-    z.object({ type: z.literal(WalletEvent.SPLICE_WALLET_EXT_ACK) }),
+    z.object({
+        type: z.literal(WalletEvent.SPLICE_WALLET_EXT_READY),
+        target: SpliceTarget.optional(),
+    }),
+    z.object({
+        type: z.literal(WalletEvent.SPLICE_WALLET_EXT_ACK),
+        target: SpliceTarget.optional(),
+    }),
     z.object({
         type: z.literal(WalletEvent.SPLICE_WALLET_EXT_OPEN),
         url: z.string().url(),
+        target: SpliceTarget.optional(),
     }),
     z.object({
         type: z.literal(WalletEvent.SPLICE_WALLET_IDP_AUTH_SUCCESS),
@@ -125,6 +140,8 @@ export const isSpliceMessage = (message: unknown): message is SpliceMessage => {
 export const DiscoverResult = z.discriminatedUnion('walletType', [
     z.object({
         walletType: z.literal('extension'),
+        /** Matches {@link ProviderId} from discovery (e.g. `browser:canton`) for session restore. */
+        providerId: z.string().optional(),
         url: z.optional(z.never()),
     }),
     z.object({
@@ -135,9 +152,72 @@ export const DiscoverResult = z.discriminatedUnion('walletType', [
 
 export type DiscoverResult = z.infer<typeof DiscoverResult>
 
-export const GatewaysConfig = z.object({
+/**
+ * Provider adapter configuration
+ */
+export const ProviderAdapterConfig = z.object({
     name: z.string(),
-    rpcUrl: z.string(),
 })
 
-export type GatewaysConfig = z.infer<typeof GatewaysConfig>
+export type ProviderAdapterConfig = z.infer<typeof ProviderAdapterConfig>
+
+/**
+ * Wallet picker entry and result
+ */
+export interface WalletPickerEntry {
+    providerId: string
+    name: string
+    type: string
+    description?: string | undefined
+    icon?: string | undefined
+    url?: string | undefined
+    /** Keep the global wallet popup open after pick for async HTTP-gateway navigation. */
+    reuseGlobalWalletPopup?: boolean | undefined
+}
+
+export interface WalletPickerResult {
+    providerId: string
+    name: string
+    type: string
+    url?: string | undefined
+    reuseGlobalWalletPopup?: boolean | undefined
+}
+
+// RPC related types
+
+export type UnknownRpcTypes = {
+    [method: string]: {
+        params: unknown
+        result: unknown
+    }
+}
+
+// RequestPayload is used at the transport layer, and encompasses wider types
+// RequestArgs is used at the provider/client layer, and is more strictly typed based on the RpcTypes of the client
+export type RequestArgs<
+    T extends UnknownRpcTypes,
+    M extends keyof T,
+> = M extends keyof T
+    ? T[M]['params'] extends never
+        ? { method: M }
+        : { method: M; params: T[M]['params'] }
+    : never
+
+export enum WALLET_DISABLED_REASON {
+    NO_SIGNING_PROVIDER_MATCHED = 'no signing provider matched',
+    // Used for participant wallets if participant node got reset, and now has a different namespace than the internal party.
+    PARTICIPANT_NAMESPACE_CHANGED = 'participant namespace changed',
+    TOPOLOGY_TRANSACTION_FAILED = 'topology transaction failed',
+    TOPOLOGY_TRANSACTION_REJECTED = 'topology transaction rejected',
+    TOPOLOGY_TRANSACTION_PENDING = 'topology transaction pending',
+}
+
+/**
+ * Provider discovery events (EIP-6963-shaped).
+ *
+ * These are dispatched on `window`:
+ * - dApp → wallets/extensions: request
+ * - wallets/extensions → dApp: announce
+ */
+export const CANTON_REQUEST_PROVIDER_EVENT = 'canton:requestProvider' as const
+export const CANTON_ANNOUNCE_PROVIDER_EVENT = 'canton:announceProvider' as const

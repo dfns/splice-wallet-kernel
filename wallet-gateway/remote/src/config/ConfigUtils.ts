@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { readFileSync, existsSync } from 'fs'
-import { Config, configSchema } from './Config.js'
+import { Config, RawConfig, rawConfigSchema } from './Config.js'
+import { Env } from '../env.js'
 
 export class ConfigUtils {
     static loadConfigFile(filePath: string): Config {
         if (existsSync(filePath)) {
-            const config = configSchema.parse(
+            const rawConfig = rawConfigSchema.parse(
                 JSON.parse(readFileSync(filePath, 'utf-8'))
             )
+
+            const config = resolveRawConfig(rawConfig)
 
             /**
              * Perform extra config validation beyond schema validation.
@@ -21,7 +24,7 @@ export class ConfigUtils {
              * 4. Each Network's auth method is compatible with its IDP type
              */
             const duplicateIdpId = hasDuplicateElement(
-                config.store.idps.map((idp) => idp.id)
+                config.bootstrap.idps.map((idp) => idp.id)
             )
             if (duplicateIdpId) {
                 throw new Error(
@@ -30,7 +33,7 @@ export class ConfigUtils {
             }
 
             const duplicateNetworkId = hasDuplicateElement(
-                config.store.networks.map((network) => network.id)
+                config.bootstrap.networks.map((network) => network.id)
             )
             if (duplicateNetworkId) {
                 throw new Error(
@@ -59,6 +62,53 @@ export class ConfigUtils {
     }
 }
 
+type RawNetworkAuth = NonNullable<
+    RawConfig['bootstrap']['networks'][number]['adminAuth']
+>
+type NetworkAuth = NonNullable<
+    Config['bootstrap']['networks'][number]['adminAuth']
+>
+
+// The Wallet Gateway can accept adminAuth secrets from environment variables.
+// However, the store expects strings. This function resolves the config from env vars
+function resolveRawNetworkAuth(n: RawNetworkAuth): NetworkAuth {
+    if (n.method === 'authorization_code') {
+        return n
+    }
+
+    if ('clientSecret' in n) {
+        return n
+    } else {
+        const { clientSecretEnv, ...rest } = n
+        const clientSecret = Env.get(clientSecretEnv, { required: true })
+        return {
+            ...rest,
+            clientSecret,
+        }
+    }
+}
+
+function resolveRawConfig(rawConfig: RawConfig): Config {
+    const rawNetworks = rawConfig.bootstrap.networks
+    const networks: Config['bootstrap']['networks'] = rawNetworks.map((n) => {
+        return {
+            ...n,
+            auth: resolveRawNetworkAuth(n.auth),
+            adminAuth: n.adminAuth
+                ? resolveRawNetworkAuth(n.adminAuth)
+                : undefined,
+        }
+    })
+
+    return {
+        ...rawConfig,
+        bootstrap: {
+            ...rawConfig.bootstrap,
+            networks,
+        },
+    }
+}
+
 function hasDuplicateElement(list: string[]): string | undefined {
     let duplicate: string | undefined
     list.forEach((item, i) => {
@@ -72,8 +122,8 @@ function hasDuplicateElement(list: string[]): string | undefined {
 function validateNetworkToIdpMapping(
     config: Config
 ): { networkId: string; idpId: string } | undefined {
-    for (const network of config.store.networks) {
-        const idp = config.store.idps.find(
+    for (const network of config.bootstrap.networks) {
+        const idp = config.bootstrap.idps.find(
             (idp) => idp.id === network.identityProviderId
         )
 
@@ -91,8 +141,8 @@ const SUPPORTED_IDP_METHODS = {
 function validateNetworkAuthMethods(
     config: Config
 ): { networkId: string; invalidAuthMethod: string } | undefined {
-    for (const network of config.store.networks) {
-        const idp = config.store.idps.find(
+    for (const network of config.bootstrap.networks) {
+        const idp = config.bootstrap.idps.find(
             (idp) => idp.id === network.identityProviderId
         )!
 

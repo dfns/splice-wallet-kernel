@@ -1,15 +1,20 @@
 // Copyright (c) 2025-2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { assertConnected, AuthContext } from '@canton-network/core-wallet-auth'
+import {
+    assertConnected,
+    AuthContext,
+    AuthTokenProvider,
+} from '@canton-network/core-wallet-auth'
 import buildController from './rpc-gen/index.js'
 import {
+    ConnectResult,
     LedgerApiParams,
+    LedgerApiResult,
     Network,
     PrepareExecuteParams,
     SignMessageResult,
     StatusEvent,
-    StatusEventAsync,
     Wallet,
 } from './rpc-gen/typings.js'
 import { Store, Transaction } from '@canton-network/core-wallet-store'
@@ -17,13 +22,14 @@ import {
     LedgerClient,
     GetEndpoint,
     PostEndpoint,
-    PostResponse,
+    PrepareSubmissionResponse,
 } from '@canton-network/core-ledger-client'
 import { v4 } from 'uuid'
 import { NotificationService } from '../notification/NotificationService.js'
 import { KernelInfo as KernelInfoConfig } from '../config/Config.js'
 import { Logger } from 'pino'
 import { networkStatus, ledgerPrepareParams } from '../utils.js'
+import type { Network as StoreNetwork } from '@canton-network/core-wallet-store'
 
 export const dappController = (
     kernelInfo: KernelInfoConfig,
@@ -40,44 +46,55 @@ export const dappController = (
         connect: async () => {
             if (!context || !(await store.getSession())) {
                 return {
-                    kernel: kernelInfo,
                     isConnected: false,
                     isNetworkConnected: false,
                     networkReason: 'Unauthenticated',
                     userUrl: `${userUrl}/login/`,
-                }
+                } satisfies ConnectResult
             }
 
-            const session = await store.getSession()
+            // const session = await store.getSession()
             const network = await store.getCurrentNetwork()
             const ledgerClient = new LedgerClient({
                 baseUrl: new URL(network.ledgerApi.baseUrl),
                 logger,
-                isAdmin: false,
-                accessToken: context.accessToken,
+                accessTokenProvider: AuthTokenProvider.fromToken(
+                    context.accessToken,
+                    logger
+                ),
             })
             const status = await networkStatus(ledgerClient)
             const notifier = notificationService.getNotifier(context.userId)
-            const StatusEvent: StatusEvent = {
-                kernel: kernelInfo,
+            const provider = {
+                id: kernelInfo.id,
+                version: 'TODO',
+                providerType: kernelInfo.clientType,
+                url: dappUrl,
+                userUrl: `${userUrl}/login/`,
+            }
+            const connection = {
                 isConnected: true,
+                reason: 'OK',
                 isNetworkConnected: status.isConnected,
                 networkReason: status.reason ? status.reason : 'OK',
+                userUrl: `${userUrl}/login/`,
+            }
+            const statusEvent: StatusEvent = {
+                provider,
+                connection,
                 network: {
                     networkId: network.id,
-                    ledgerApi: {
-                        baseUrl: network.ledgerApi.baseUrl,
-                    },
+                    ledgerApi: network.ledgerApi.baseUrl,
+                    accessToken: context.accessToken,
                 },
                 session: {
-                    id: session?.id,
                     accessToken: context.accessToken,
                     userId: context.userId,
                 },
-                userUrl: `${userUrl}/login/`,
             }
-            notifier.emit('statusChanged', StatusEvent)
-            return StatusEvent as StatusEventAsync
+            notifier.emit('statusChanged', statusEvent)
+            notifier.emit('connected', statusEvent)
+            return connection
         },
         disconnect: async () => {
             if (!context) {
@@ -86,37 +103,78 @@ export const dappController = (
                 const notifier = notificationService.getNotifier(context.userId)
                 await store.removeSession()
                 notifier.emit('statusChanged', {
-                    kernel: kernelInfo,
-                    isConnected: false,
-                    isNetworkConnected: false,
-                    networkReason: 'disconnect',
-                    userUrl: `${userUrl}/login/`,
+                    provider: {
+                        id: kernelInfo.id,
+                        providerType: kernelInfo.clientType,
+                        url: dappUrl,
+                        userUrl: `${userUrl}/login/`,
+                    },
+                    connection: {
+                        isConnected: false,
+                        reason: 'disconnect',
+                        isNetworkConnected: false,
+                        networkReason: 'disconnect',
+                    },
                 } as StatusEvent)
             }
 
             return null
+        },
+        isConnected: async () => {
+            if (!context || !(await store.getSession())) {
+                return {
+                    isConnected: false,
+                    isNetworkConnected: false,
+                    networkReason: 'Unauthenticated',
+                    userUrl: `${userUrl}/login/`,
+                } satisfies ConnectResult
+            }
+
+            const network = await store.getCurrentNetwork()
+            const ledgerClient = new LedgerClient({
+                baseUrl: new URL(network.ledgerApi.baseUrl),
+                logger,
+                accessTokenProvider: AuthTokenProvider.fromToken(
+                    context.accessToken,
+                    logger
+                ),
+            })
+            const status = await networkStatus(ledgerClient)
+            return {
+                isConnected: true,
+                reason: 'OK',
+                isNetworkConnected: status.isConnected,
+                networkReason: status.reason ? status.reason : 'OK',
+                userUrl: `${userUrl}/login/`,
+            } satisfies ConnectResult
         },
         ledgerApi: async (params: LedgerApiParams) => {
             const network = await store.getCurrentNetwork()
             const ledgerClient = new LedgerClient({
                 baseUrl: new URL(network.ledgerApi.baseUrl),
                 logger,
-                isAdmin: false,
-                accessToken: assertConnected(context).accessToken,
+                accessTokenProvider: AuthTokenProvider.fromToken(
+                    assertConnected(context).accessToken,
+                    logger
+                ),
             })
-            let result: unknown
+
+            let result: LedgerApiResult
+
             switch (params.requestMethod) {
-                case 'GET':
+                case 'get':
                     result = await ledgerClient.getWithRetry(
-                        params.resource as GetEndpoint
+                        params.resource as GetEndpoint,
+                        undefined,
+                        { path: params.path ?? {}, query: params.query ?? {} }
                     )
                     break
-                case 'POST':
+                case 'post':
                     result = await ledgerClient.postWithRetry(
                         params.resource as PostEndpoint,
-                        params.body
-                            ? (JSON.parse(params.body) as never)
-                            : (undefined as never)
+                        params.body as never,
+                        undefined,
+                        { query: params.query ?? {}, path: params.path ?? {} }
                     )
                     break
                 default:
@@ -124,9 +182,7 @@ export const dappController = (
                         `Unsupported request method: ${params.requestMethod}`
                     )
             }
-            return {
-                response: JSON.stringify(result),
-            }
+            return result
         },
         prepareExecute: async (params: PrepareExecuteParams) => {
             const wallet = await store.getPrimaryWallet()
@@ -143,8 +199,10 @@ export const dappController = (
             const ledgerClient = new LedgerClient({
                 baseUrl: new URL(network.ledgerApi.baseUrl),
                 logger,
-                isAdmin: false,
-                accessToken: context.accessToken,
+                accessTokenProvider: AuthTokenProvider.fromToken(
+                    context.accessToken,
+                    logger
+                ),
             })
 
             const userId = context.userId
@@ -152,6 +210,7 @@ export const dappController = (
 
             params.commandId = params.commandId || v4()
             const commandId = params.commandId
+            const transactionId = v4()
 
             notifier.emit('txChanged', { status: 'pending', commandId })
 
@@ -159,38 +218,62 @@ export const dappController = (
                 network.synchronizerId ??
                 (await ledgerClient.getSynchronizerId())
 
-            const { preparedTransactionHash, preparedTransaction = '' } =
-                await prepareSubmission(
-                    context.userId,
-                    wallet.partyId,
-                    synchronizerId,
-                    params,
-                    ledgerClient
-                )
-
+            const response = await prepareSubmission(
+                context.userId,
+                wallet.partyId,
+                synchronizerId,
+                params,
+                ledgerClient
+            )
             const transaction: Transaction = {
+                id: transactionId,
                 commandId,
                 status: 'pending',
-                preparedTransaction,
-                preparedTransactionHash,
+                preparedTransaction: response.preparedTransaction!,
+                preparedTransactionHash: response.preparedTransactionHash,
                 payload: params,
                 origin: origin || null,
                 createdAt: new Date(),
             }
 
-            store.setTransaction(transaction)
+            logger.info(
+                {
+                    actAs: params.actAs || [wallet.partyId],
+                    readAs: params.readAs || [],
+                    userId: context.userId,
+                    commandId,
+                    commands: params.commands?.[0],
+                    confirmationRequestTrafficCostEstimation:
+                        response.costEstimation
+                            ?.confirmationRequestTrafficCostEstimation,
+                },
+                'prepared transaction traffic estimation'
+            )
+
+            await store.setTransaction(transaction)
 
             return {
-                userUrl: `${userUrl}/approve/index.html?commandId=${commandId}`,
+                // closeafteraction query param flag makes approving or deleting tx close the popup
+                userUrl: `${userUrl}/approve/index.html?transactionId=${transactionId}&commandId=${commandId}&closeafteraction`,
             }
         },
         status: async () => {
+            const provider = {
+                id: kernelInfo.id,
+                version: 'TODO',
+                providerType: kernelInfo.clientType,
+                url: dappUrl,
+                userUrl: `${userUrl}/login/`,
+            }
             if (!context || !(await store.getSession())) {
                 return {
-                    kernel: kernelInfo,
-                    isConnected: false,
-                    isNetworkConnected: false,
-                    networkReason: 'Unauthenticated',
+                    provider: provider,
+                    connection: {
+                        isConnected: false,
+                        reason: 'Unauthenticated',
+                        isNetworkConnected: false,
+                        networkReason: 'Unauthenticated',
+                    },
                 }
             }
 
@@ -199,20 +282,25 @@ export const dappController = (
             const ledgerClient = new LedgerClient({
                 baseUrl: new URL(network.ledgerApi.baseUrl),
                 logger,
-                isAdmin: false,
-                accessToken: context.accessToken,
+                accessTokenProvider: AuthTokenProvider.fromToken(
+                    context.accessToken,
+                    logger
+                ),
             })
             const status = await networkStatus(ledgerClient)
+
             return {
-                kernel: kernelInfo,
-                isConnected: true,
-                isNetworkConnected: status.isConnected,
-                networkReason: status.reason ? status.reason : 'OK',
+                provider: provider,
+                connection: {
+                    isConnected: true,
+                    reason: 'OK',
+                    isNetworkConnected: status.isConnected,
+                    networkReason: status.reason ? status.reason : 'OK',
+                },
                 network: {
                     networkId: network.id,
-                    ledgerApi: {
-                        baseUrl: network.ledgerApi.baseUrl,
-                    },
+                    ledgerApi: network.ledgerApi.baseUrl,
+                    accessToken: context.accessToken,
                 },
                 session: {
                     id: session?.id,
@@ -220,7 +308,7 @@ export const dappController = (
                     userId: context.userId,
                 },
                 userUrl: `${userUrl}/login/`,
-            } as StatusEventAsync
+            }
         },
         connected: async () => {
             throw new Error('Only for events.')
@@ -237,8 +325,15 @@ export const dappController = (
         txChanged: async () => {
             throw new Error('Only for events.')
         },
-        getActiveNetwork: function (): Promise<Network> {
-            throw new Error('Function not implemented.')
+        getActiveNetwork: async (): Promise<Network> => {
+            const network: StoreNetwork = await store.getCurrentNetwork()
+            return {
+                networkId: network.id,
+                ledgerApi: network.ledgerApi.baseUrl,
+                ...(context?.accessToken
+                    ? { accessToken: context.accessToken }
+                    : {}),
+            }
         },
         signMessage: function (): Promise<SignMessageResult> {
             throw new Error('Function not implemented.')
@@ -259,7 +354,7 @@ async function prepareSubmission(
     synchronizerId: string,
     params: PrepareExecuteParams,
     ledgerClient: LedgerClient
-): Promise<PostResponse<'/v2/interactive-submission/prepare'>> {
+): Promise<PrepareSubmissionResponse> {
     return await ledgerClient.postWithRetry(
         '/v2/interactive-submission/prepare',
         ledgerPrepareParams(userId, partyId, synchronizerId, params)

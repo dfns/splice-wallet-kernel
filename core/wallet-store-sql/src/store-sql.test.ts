@@ -1,7 +1,7 @@
 // Copyright (c) 2025-2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, test } from '@jest/globals'
+import { describe, expect, test, beforeEach, afterEach } from 'vitest'
 
 import {
     AuthContext,
@@ -11,7 +11,9 @@ import {
 import {
     LedgerApi,
     Network,
+    PartyLevelRight,
     Session,
+    Transaction,
     Wallet,
 } from '@canton-network/core-wallet-store'
 import { Kysely } from 'kysely'
@@ -232,6 +234,42 @@ implementations.forEach(([name, StoreImpl]) => {
             const primary = await store.getPrimaryWallet()
             expect(primary?.partyId).toBe('party2')
             expect(primary?.primary).toBe(true)
+        })
+
+        test('should persist wallet rights and update rights-only changes', async () => {
+            const wallet: Wallet = {
+                primary: false,
+                partyId: 'party-rights',
+                status: 'allocated',
+                hint: 'rights',
+                signingProviderId: 'internal',
+                publicKey: 'publicKey',
+                namespace: 'namespace',
+                networkId: 'network1',
+                rights: [
+                    PartyLevelRight.CanActAs,
+                    PartyLevelRight.CanExecuteAs,
+                ],
+            }
+            const store = new StoreImpl(db, pino(sink()), authContextMock)
+            await store.addIdp(idp)
+            await store.addNetwork(network)
+            await store.setSession({
+                id: 'session-rights',
+                network: 'network1',
+                accessToken: 'token',
+            })
+            await store.addWallet(wallet)
+
+            await store.updateWallet({
+                partyId: 'party-rights',
+                rights: [PartyLevelRight.CanReadAs],
+            })
+
+            const fetchedWallet = (await store.getWallets()).find(
+                (w) => w.partyId === 'party-rights'
+            )
+            expect(fetchedWallet?.rights).toEqual([PartyLevelRight.CanReadAs])
         })
 
         test('should set and get session', async () => {
@@ -519,73 +557,142 @@ implementations.forEach(([name, StoreImpl]) => {
             ).toBe('party1::namespace')
         })
 
-        test('addWallet should update userId when same party+network exists with different user', async () => {
-            const wallet1: Wallet = {
+        test('should allow duplicate commandIds and update by transaction id', async () => {
+            const store = new StoreImpl(db, pino(sink()), authContextMock)
+            await store.addIdp(idp)
+            await store.addNetwork(network)
+            await store.setSession({
+                id: 'session-tx-immutable',
+                network: 'network1',
+                accessToken: 'token',
+            })
+
+            const initial: Transaction = {
+                id: 'tx-immutable-1',
+                commandId: 'cmd-immutable',
+                status: 'pending',
+                preparedTransaction: 'prepared-1',
+                preparedTransactionHash: 'hash-1',
+                payload: { amount: 100 },
+                origin: 'https://safe.example',
+                createdAt: new Date('2026-01-01T00:00:00.000Z'),
+            }
+
+            await store.setTransaction(initial)
+
+            await store.setTransaction({
+                ...initial,
+                id: 'tx-immutable-2',
+            })
+
+            await store.setTransactionSigned(
+                initial.id,
+                new Date('2026-01-01T00:01:00.000Z')
+            )
+            await store.setTransactionStatus(initial.id, 'executed', {
+                payload: { result: 'ok' },
+            })
+
+            const persisted = await store.getTransaction(initial.id)
+            expect(persisted?.preparedTransaction).toBe('prepared-1')
+            expect(persisted?.preparedTransactionHash).toBe('hash-1')
+            expect(persisted?.payload).toEqual({ result: 'ok' })
+            expect(persisted?.origin).toBe('https://safe.example')
+            expect(persisted?.status).toBe('executed')
+            expect(persisted?.signedAt).toEqual(
+                new Date('2026-01-01T00:01:00.000Z')
+            )
+
+            const duplicates = await store.listTransactions()
+            expect(
+                duplicates.filter((tx) => tx.commandId === initial.commandId)
+            ).toHaveLength(2)
+        })
+
+        test('removeWallet should cascade-delete userPartyRights', async () => {
+            const store = new StoreImpl(db, pino(sink()), authContextMock)
+            await store.addIdp(idp)
+            await store.addNetwork(network)
+            await store.setSession({
+                id: 'session-cascade-wallet',
+                network: 'network1',
+                accessToken: 'token',
+            })
+
+            await store.addWallet({
                 primary: false,
-                partyId: 'party1::namespace',
+                partyId: 'party-cascade-1',
                 status: 'allocated',
-                hint: 'party1',
+                hint: 'hint',
+                signingProviderId: 'participant',
+                publicKey: 'publicKey',
+                namespace: 'namespace',
+                networkId: 'network1',
+                rights: [PartyLevelRight.CanActAs],
+            })
+
+            const beforeRights = await db
+                .selectFrom('userPartyRights')
+                .selectAll()
+                .execute()
+            expect(beforeRights).toHaveLength(1)
+
+            await store.removeWallet('party-cascade-1')
+
+            const afterRights = await db
+                .selectFrom('userPartyRights')
+                .selectAll()
+                .execute()
+            expect(afterRights).toHaveLength(0)
+        })
+
+        test('removeNetwork should cascade-delete wallets and transactions', async () => {
+            const store = new StoreImpl(db, pino(sink()), authContextMock)
+            await store.addIdp(idp)
+            await store.addNetwork(network)
+            await store.setSession({
+                id: 'session-cascade-network',
+                network: 'network1',
+                accessToken: 'token',
+            })
+
+            await store.addWallet({
+                primary: false,
+                partyId: 'party-cascade-2',
+                status: 'allocated',
+                hint: 'hint',
                 signingProviderId: 'internal',
                 publicKey: 'publicKey',
                 namespace: 'namespace',
                 networkId: 'network1',
-            }
-            const store = new StoreImpl(db, pino(sink()), authContextMock)
-            await store.addIdp(idp)
-            await store.addNetwork(network)
+            })
 
-            const session: Session = {
-                id: 'sess-123',
-                network: 'network1',
-                accessToken: 'token',
-            }
-            await store.setSession(session)
-            await store.addWallet(wallet1)
+            await store.setTransaction({
+                id: 'tx-cascade-1',
+                commandId: 'cmd-cascade-1',
+                status: 'pending',
+                preparedTransaction: 'prepared',
+                preparedTransactionHash: 'hash',
+                origin: 'https://localhost',
+            })
 
-            // Verify wallet was created with first user's ID
-            const walletBefore = await db
-                .selectFrom('wallets')
+            expect((await store.listNetworks()).map((n) => n.id)).toEqual([
+                'network1',
+            ])
+            expect(await store.getWallets()).toHaveLength(1)
+            expect(await store.listTransactions()).toHaveLength(1)
+
+            await store.removeNetwork('network1')
+
+            expect(await store.listNetworks()).toHaveLength(0)
+            expect(
+                await store.getAllWallets({ networkIds: ['network1'] })
+            ).toHaveLength(0)
+            const remainingTransactions = await db
+                .selectFrom('transactions')
                 .selectAll()
-                .where('party_id', '=', 'party1::namespace')
-                .where('network_id', '=', 'network1')
-                .executeTakeFirst()
-            expect(walletBefore?.userId).toBe('test-user-id')
-
-            // Create new store with different user
-            const authContext2: AuthContext = {
-                userId: 'test-user-id-2',
-                accessToken: 'test-access-token-2',
-            }
-            const store2 = new StoreImpl(db, pino(sink()), authContext2)
-            const session2: Session = {
-                id: 'sess-456',
-                network: 'network1',
-                accessToken: 'token',
-            }
-            await store2.setSession(session2)
-
-            // Add same wallet (same party+network) - should update userId
-            await store2.addWallet(wallet1)
-
-            // Verify wallet userId was updated to second user's ID
-            const walletAfter = await db
-                .selectFrom('wallets')
-                .selectAll()
-                .where('party_id', '=', 'party1::namespace')
-                .where('network_id', '=', 'network1')
-                .executeTakeFirst()
-            expect(walletAfter?.userId).toBe('test-user-id-2')
-            expect(walletAfter?.partyId).toBe('party1::namespace')
-            expect(walletAfter?.networkId).toBe('network1')
-
-            // Verify there's still only one wallet (not duplicated)
-            const allWallets = await db
-                .selectFrom('wallets')
-                .selectAll()
-                .where('party_id', '=', 'party1::namespace')
-                .where('network_id', '=', 'network1')
                 .execute()
-            expect(allWallets).toHaveLength(1)
+            expect(remainingTransactions).toHaveLength(0)
         })
     })
 })

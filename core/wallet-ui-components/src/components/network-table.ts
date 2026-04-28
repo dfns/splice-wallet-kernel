@@ -12,6 +12,7 @@ import { Session } from '@canton-network/core-wallet-user-rpc-client'
 export class NetworkTable extends BaseElement {
     @property({ type: Array }) networks: Network[] = []
     @property({ type: Array }) activeSessions: Session[] = []
+    @property({ type: Boolean }) readonly = false
 
     static styles = [BaseElement.styles]
 
@@ -22,13 +23,15 @@ export class NetworkTable extends BaseElement {
                     class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-md-2 g-lg-2 g-0"
                 >
                     ${this.networks.map((net) => {
-                        const isActive = this.activeSessions.some(
-                            (session) => session.network.id === net.id
+                        const session = this.activeSessions.find(
+                            (s) => s.network.id === net.id
                         )
                         return html`
                             <network-card
                                 .network=${net}
-                                .activeSession=${isActive}
+                                .activeSession=${!!session}
+                                .accessToken=${session?.accessToken ?? ''}
+                                .readonly=${this.readonly}
                             ></network-card>
                         `
                     })}

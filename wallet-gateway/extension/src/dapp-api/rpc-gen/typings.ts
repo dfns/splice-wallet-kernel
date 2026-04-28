@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
+/* eslint-disable @typescript-eslint/no-unused-vars */
 
 /**
  *
@@ -9,6 +10,7 @@
  *
  */
 export type CommandId = string
+type AlwaysTrue = any
 /**
  *
  * Structure representing JS commands for transaction execution
@@ -69,7 +71,6 @@ export interface DisclosedContract {
     contractId?: ContractId
     createdEventBlob: CreatedEventBlob
     synchronizerId?: SynchronizerId
-    [k: string]: any
 }
 /**
  *
@@ -90,24 +91,48 @@ export type PackageIdSelectionPreference = PackageId[]
  *
  */
 export type Message = string
-export type RequestMethod = 'GET' | 'POST' | 'PUT' | 'DELETE'
+export type RequestMethod = 'get' | 'post' | 'patch' | 'put' | 'delete'
 export type Resource = string
-export type Body = string
+export interface Body {
+    [key: string]: any
+}
 /**
  *
- * The unique identifier of the Wallet Gateway.
+ * Query parameters as key-value pairs.
  *
  */
-export type Id = string
+export interface Query {
+    [key: string]: any
+}
 /**
  *
- * The type of client that implements the Wallet Gateway.
+ * Path parameters as key-value pairs.
  *
  */
-export type ClientType = 'browser' | 'desktop' | 'mobile' | 'remote'
+export interface Path {
+    [key: string]: any
+}
 /**
  *
- * The URL of the Wallet Gateway.
+ * The unique identifier of the Provider.
+ *
+ */
+export type ProviderId = string
+/**
+ *
+ * The version of the Provider.
+ *
+ */
+export type Version = string
+/**
+ *
+ * The type of client that implements the Provider.
+ *
+ */
+export type ProviderType = 'browser' | 'desktop' | 'mobile' | 'remote'
+/**
+ *
+ * The URL of the Wallet Provider.
  *
  */
 export type Url = string
@@ -119,22 +144,28 @@ export type Url = string
 export type UserUrl = string
 /**
  *
- * Represents a Wallet Gateway.
+ * Represents a Provider.
  *
  */
-export interface KernelInfo {
-    id: Id
-    clientType: ClientType
+export interface Provider {
+    id: ProviderId
+    version?: Version
+    providerType?: ProviderType
     url?: Url
     userUrl?: UserUrl
-    [k: string]: any
 }
 /**
  *
  * Whether or not the user is authenticated with the Wallet.
  *
  */
-export type IsConnected = boolean
+export type IsConnectedValue = boolean
+/**
+ *
+ * Reason for the wallet state, e.g., 'no signing provider matched'.
+ *
+ */
+export type Reason = string
 /**
  *
  * Whether or not a connection to a network is established.
@@ -147,6 +178,13 @@ export type IsNetworkConnected = boolean
  *
  */
 export type NetworkReason = string
+export interface ConnectResult {
+    isConnected: IsConnectedValue
+    reason?: Reason
+    isNetworkConnected: IsNetworkConnected
+    networkReason?: NetworkReason
+    userUrl?: UserUrl
+}
 /**
  *
  * The network ID the wallet corresponds to.
@@ -158,16 +196,13 @@ export type NetworkId = string
  * The base URL of the ledger API.
  *
  */
-export type BaseUrl = string
+export type LedgerApiUrl = string
 /**
  *
- * Ledger API configuration.
+ * JWT authentication token.
  *
  */
-export interface LedgerApiConfig {
-    baseUrl: BaseUrl
-    [k: string]: any
-}
+export type AccessToken = string
 /**
  *
  * Network information, if connected to a network.
@@ -175,15 +210,9 @@ export interface LedgerApiConfig {
  */
 export interface Network {
     networkId: NetworkId
-    ledgerApi?: LedgerApiConfig
-    [k: string]: any
+    ledgerApi?: LedgerApiUrl
+    accessToken?: AccessToken
 }
-/**
- *
- * JWT authentication token.
- *
- */
-export type AccessToken = string
 /**
  *
  * The user identifier.
@@ -198,7 +227,6 @@ export type UserId = string
 export interface Session {
     accessToken: AccessToken
     userId: UserId
-    [k: string]: any
 }
 /**
  *
@@ -238,7 +266,6 @@ export interface TxChangedExecutedEvent {
  *
  */
 export type Signature = string
-export type Response = string
 /**
  *
  * Set as primary wallet for dApp usage.
@@ -256,7 +283,7 @@ export type PartyId = string
  * The status of the wallet.
  *
  */
-export type WalletStatus = 'initialized' | 'allocated'
+export type WalletStatus = 'initialized' | 'allocated' | 'removed'
 /**
  *
  * The party hint and name of the wallet.
@@ -301,12 +328,6 @@ export type TopologyTransactions = string
 export type Disabled = boolean
 /**
  *
- * Reason for the wallet state, e.g., 'no signing provider matched'.
- *
- */
-export type Reason = string
-/**
- *
  * Structure representing a wallet
  *
  */
@@ -323,7 +344,6 @@ export interface Wallet {
     topologyTransactions?: TopologyTransactions
     disabled?: Disabled
     reason?: Reason
-    [k: string]: any
 }
 /**
  *
@@ -400,7 +420,6 @@ export interface PrepareExecuteParams {
     disclosedContracts?: DisclosedContracts
     synchronizerId?: SynchronizerId
     packageIdSelectionPreference?: PackageIdSelectionPreference
-    [k: string]: any
 }
 /**
  *
@@ -409,7 +428,6 @@ export interface PrepareExecuteParams {
  */
 export interface SignMessageParams {
     message: Message
-    [k: string]: any
 }
 /**
  *
@@ -420,16 +438,14 @@ export interface LedgerApiParams {
     requestMethod: RequestMethod
     resource: Resource
     body?: Body
-    [k: string]: any
+    query?: Query
+    path?: Path
 }
 export interface StatusEvent {
-    kernel: KernelInfo
-    isConnected: IsConnected
-    isNetworkConnected: IsNetworkConnected
-    networkReason?: NetworkReason
+    provider: Provider
+    connection: ConnectResult
     network?: Network
     session?: Session
-    [k: string]: any
 }
 /**
  *
@@ -439,7 +455,6 @@ export interface StatusEvent {
 export type Null = null
 export interface PrepareExecuteAndWaitResult {
     tx: TxChangedExecutedEvent
-    [k: string]: any
 }
 /**
  *
@@ -448,16 +463,14 @@ export interface PrepareExecuteAndWaitResult {
  */
 export interface SignMessageResult {
     signature: Signature
-    [k: string]: any
 }
 /**
  *
- * Ledger Api configuration options
+ * Ledger Api response
  *
  */
 export interface LedgerApiResult {
-    response: Response
-    [k: string]: any
+    [key: string]: any
 }
 /**
  *
@@ -488,8 +501,9 @@ export type TxChangedEvent =
  */
 
 export type Status = () => Promise<StatusEvent>
-export type Connect = () => Promise<StatusEvent>
+export type Connect = () => Promise<ConnectResult>
 export type Disconnect = () => Promise<Null>
+export type IsConnected = () => Promise<ConnectResult>
 export type GetActiveNetwork = () => Promise<Network>
 export type PrepareExecute = (params: PrepareExecuteParams) => Promise<Null>
 export type PrepareExecuteAndWait = (

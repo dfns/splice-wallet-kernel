@@ -7,8 +7,8 @@ import {
     UserId,
     AuthAware,
     assertConnected,
-    AccessTokenProvider,
     Idp,
+    AuthTokenProvider,
 } from '@canton-network/core-wallet-auth'
 import {
     Store,
@@ -19,6 +19,9 @@ import {
     Transaction,
     Network,
     UpdateWallet,
+    PartyLevelRight,
+    TransactionStatusUpdate,
+    UserLevelRight,
 } from '@canton-network/core-wallet-store'
 import {
     LedgerClient,
@@ -30,6 +33,7 @@ interface UserStorage {
     wallets: Array<Wallet>
     transactions: Map<string, Transaction>
     session: Session | undefined
+    userRightsByNetwork: Map<string, Set<UserLevelRight>>
 }
 
 export interface StoreInternalConfig {
@@ -75,6 +79,7 @@ export class StoreInternal implements Store, AuthAware<StoreInternal> {
             wallets: [],
             transactions: new Map<string, Transaction>(),
             session: undefined,
+            userRightsByNetwork: new Map<string, Set<UserLevelRight>>(),
         }
     }
 
@@ -102,10 +107,10 @@ export class StoreInternal implements Store, AuthAware<StoreInternal> {
             const network = await this.getCurrentNetwork()
 
             // Get existing parties from participant
-            const userAccessTokenProvider: AccessTokenProvider = {
-                getUserAccessToken: async () => this.authContext!.accessToken,
-                getAdminAccessToken: async () => this.authContext!.accessToken,
-            }
+            const userAccessTokenProvider = AuthTokenProvider.fromToken(
+                this.authContext!.accessToken,
+                this.logger
+            )
 
             const ledgerClient = new LedgerClient({
                 baseUrl: new URL(network.ledgerApi.baseUrl),
@@ -121,14 +126,33 @@ export class StoreInternal implements Store, AuthAware<StoreInternal> {
                     },
                 }
             )
-            const parties = rights.rights
-                ?.filter((right) => 'CanActAs' in right.kind)
-                .map((right) => {
-                    if ('CanActAs' in right.kind) {
-                        return right.kind.CanActAs.value.party
-                    }
-                    throw new Error('Unexpected right kind')
-                })
+            const rightsByParty = new Map<string, Set<PartyLevelRight>>()
+            const getRights = (party: string) => {
+                const existing = rightsByParty.get(party)
+                if (existing) return existing
+                const created = new Set<PartyLevelRight>()
+                rightsByParty.set(party, created)
+                return created
+            }
+            rights.rights?.forEach((right) => {
+                if (!right || !right.kind) {
+                    return
+                }
+                if ('CanActAs' in right.kind) {
+                    getRights(right.kind.CanActAs.value.party).add(
+                        PartyLevelRight.CanActAs
+                    )
+                } else if ('CanReadAs' in right.kind) {
+                    getRights(right.kind.CanReadAs.value.party).add(
+                        PartyLevelRight.CanReadAs
+                    )
+                } else if ('CanExecuteAs' in right.kind) {
+                    getRights(right.kind.CanExecuteAs.value.party).add(
+                        PartyLevelRight.CanExecuteAs
+                    )
+                }
+            })
+            const parties = Array.from(rightsByParty.keys())
 
             // Merge Wallets - check for duplicates by (partyId, networkId)
             const existingWallets = await this.getAllWallets({
@@ -157,6 +181,7 @@ export class StoreInternal implements Store, AuthAware<StoreInternal> {
                             namespace: namespace,
                             networkId: network.id,
                             signingProviderId: 'participant', // todo: determine based on partyDetails.isLocal
+                            rights: [...(rightsByParty.get(party) ?? [])],
                         }
                     }) || []
             const storage = this.getStorage()
@@ -273,19 +298,15 @@ export class StoreInternal implements Store, AuthAware<StoreInternal> {
         this.updateStorage(storage)
     }
 
-    async updateWallet({
-        status,
-        partyId,
-        networkId,
-        externalTxId,
-    }: UpdateWallet): Promise<void> {
+    async updateWallet(params: UpdateWallet): Promise<void> {
         const storage = this.getStorage()
-        // Use provided networkId or get current network from session
+        const { partyId, networkId, ...updates } = params
         const targetNetworkId = networkId ?? (await this.getCurrentNetwork()).id
+        if (Object.keys(updates).length === 0) return
 
         const wallets = storage.wallets.map((wallet) =>
             wallet.partyId === partyId && wallet.networkId === targetNetworkId
-                ? { ...wallet, status, externalTxId }
+                ? { ...wallet, ...updates }
                 : wallet
         )
 
@@ -301,6 +322,23 @@ export class StoreInternal implements Store, AuthAware<StoreInternal> {
         )
 
         storage.wallets = wallets
+        this.updateStorage(storage)
+    }
+
+    async getUserRights(networkId?: string): Promise<Array<UserLevelRight>> {
+        const targetNetworkId = networkId ?? (await this.getCurrentNetwork()).id
+        const rights =
+            this.getStorage().userRightsByNetwork.get(targetNetworkId) ??
+            new Set<UserLevelRight>()
+        return [...rights]
+    }
+
+    async setUserRights(
+        networkId: string,
+        rights: Array<UserLevelRight>
+    ): Promise<void> {
+        const storage = this.getStorage()
+        storage.userRightsByNetwork.set(networkId, new Set(rights))
         this.updateStorage(storage)
     }
 
@@ -423,20 +461,98 @@ export class StoreInternal implements Store, AuthAware<StoreInternal> {
         )
     }
 
+    private mergeTransactionStatusUpdate(
+        existing: Transaction,
+        status: Transaction['status'],
+        updates: TransactionStatusUpdate = {}
+    ): Transaction {
+        const payload = updates.payload ?? existing.payload
+        const signedAt = updates.signedAt ?? existing.signedAt
+        const externalTxId = updates.externalTxId ?? existing.externalTxId
+
+        return {
+            id: existing.id,
+            commandId: existing.commandId,
+            status,
+            preparedTransaction: existing.preparedTransaction,
+            preparedTransactionHash: existing.preparedTransactionHash,
+            origin: existing.origin,
+            ...(payload !== undefined && { payload }),
+            ...(existing.createdAt !== undefined && {
+                createdAt: existing.createdAt,
+            }),
+            ...(signedAt !== undefined && { signedAt }),
+            ...(externalTxId !== undefined && { externalTxId }),
+        }
+    }
+
     // Transaction methods
     async setTransaction(transaction: Transaction): Promise<void> {
         this.assertConnected()
         const storage = this.getStorage()
 
-        storage.transactions.set(transaction.commandId, transaction)
+        storage.transactions.set(transaction.id, transaction)
         this.updateStorage(storage)
     }
 
-    async getTransaction(commandId: string): Promise<Transaction | undefined> {
+    async setTransactionSigned(
+        transactionId: string,
+        signedAt: Date,
+        externalTxId?: string
+    ): Promise<void> {
+        await this.setTransactionStatus(transactionId, 'signed', {
+            signedAt,
+            ...(externalTxId !== undefined && { externalTxId }),
+        })
+    }
+
+    async setTransactionStatus(
+        transactionId: string,
+        status: Transaction['status'],
+        updates: TransactionStatusUpdate = {}
+    ): Promise<void> {
+        this.assertConnected()
+        const storage = this.getStorage()
+        const existing = storage.transactions.get(transactionId)
+        if (!existing) {
+            throw new Error(`Transaction not found with id: ${transactionId}`)
+        }
+
+        const updated = this.mergeTransactionStatusUpdate(
+            existing,
+            status,
+            updates
+        )
+
+        storage.transactions.set(transactionId, updated)
+        this.updateStorage(storage)
+    }
+
+    async getTransaction(
+        transactionId: string
+    ): Promise<Transaction | undefined> {
         this.assertConnected()
         const storage = this.getStorage()
 
-        return storage.transactions.get(commandId)
+        return storage.transactions.get(transactionId)
+    }
+
+    async getLatestTransactionByCommandId(
+        commandId: string
+    ): Promise<Transaction | undefined> {
+        this.assertConnected()
+        const storage = this.getStorage()
+
+        return Array.from(storage.transactions.values())
+            .filter((tx) => tx.commandId === commandId)
+            .sort((a, b) => {
+                const aTime = a.createdAt?.getTime() ?? 0
+                const bTime = b.createdAt?.getTime() ?? 0
+                if (aTime !== bTime) {
+                    return bTime - aTime
+                }
+                return b.id.localeCompare(a.id)
+            })[0]
     }
 
     async listTransactions(): Promise<Array<Transaction>> {
@@ -444,5 +560,13 @@ export class StoreInternal implements Store, AuthAware<StoreInternal> {
         const storage = this.getStorage()
 
         return Array.from(storage.transactions.values())
+    }
+
+    async removeTransaction(transactionId: string): Promise<void> {
+        this.assertConnected()
+        const storage = this.getStorage()
+
+        storage.transactions.delete(transactionId)
+        this.updateStorage(storage)
     }
 }

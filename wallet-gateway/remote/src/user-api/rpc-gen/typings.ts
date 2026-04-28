@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
+/* eslint-disable @typescript-eslint/no-unused-vars */
 
 /**
  *
@@ -134,36 +135,6 @@ export type SigningProviderId = string
 export type PartyId = string
 /**
  *
- * Unique identifier of the signed transaction given by the Signing Provider. This may not be the same as the internal txId given by the Wallet Gateway.
- *
- */
-export type ExternalTxId = string
-/**
- *
- * The topology transactions
- *
- */
-export type TopologyTransactions = string
-/**
- *
- * The namespace of the party.
- *
- */
-export type Namespace = string
-/**
- *
- * Indicates that the wallet has been created in the database but hasn't yet been allocated by the participant.
- *
- */
-export interface SigningProviderContext {
-    partyId: PartyId
-    externalTxId: ExternalTxId
-    topologyTransactions: TopologyTransactions
-    namespace: Namespace
-    [k: string]: any
-}
-/**
- *
  * Filter wallets by network IDs.
  *
  */
@@ -182,26 +153,13 @@ export type SigningProviderIds = SigningProviderId[]
 export interface WalletFilter {
     networkIds?: NetworkIds
     signingProviderIds?: SigningProviderIds
-    [k: string]: any
 }
 /**
  *
- * The transaction data corresponding to the command ID.
+ * The internal transaction identifier.
  *
  */
-export type PreparedTransaction = string
-/**
- *
- * The hash of the prepared transaction.
- *
- */
-export type PreparedTransactionHash = string
-/**
- *
- * The unique identifier of the command associated with the transaction.
- *
- */
-export type CommandId = string
+export type TransactionId = string
 export type Signature = string
 export type SignedBy = string
 export type Networks = Network[]
@@ -211,7 +169,7 @@ export type Idps = Idp[]
  * The status of the wallet.
  *
  */
-export type WalletStatus = 'initialized' | 'allocated'
+export type WalletStatus = 'initialized' | 'allocated' | 'removed'
 /**
  *
  * The party hint and name of the wallet.
@@ -226,6 +184,24 @@ export type Hint = string
 export type PublicKey = string
 /**
  *
+ * The namespace of the party.
+ *
+ */
+export type Namespace = string
+/**
+ *
+ * External transaction ID from signing provider.
+ *
+ */
+export type ExternalTxId = string
+/**
+ *
+ * The topology transactions
+ *
+ */
+export type TopologyTransactions = string
+/**
+ *
  * Whether the wallet is disabled. Wallets are disabled when no signing provider matches the party's namespace during sync. Disabled wallets use participant as the default signing provider.
  *
  */
@@ -236,6 +212,13 @@ export type Disabled = boolean
  *
  */
 export type Reason = string
+export type PartyLevelRight = any
+/**
+ *
+ * The rights of the user for the network.
+ *
+ */
+export type Rights = UserLevelRight[]
 /**
  *
  * Structure representing a wallet
@@ -254,16 +237,59 @@ export interface Wallet {
     topologyTransactions?: TopologyTransactions
     disabled?: Disabled
     reason?: Reason
-    [k: string]: any
+    rights: Rights
 }
-export type Added = Wallet[]
-export type Removed = Wallet[]
+type AlwaysTrue = any
+/**
+ *
+ * Non-disabled wallets added in this syncWallets call.
+ *
+ */
+export type SyncWalletsResultAdded = Wallet[]
+/**
+ *
+ * Existing wallets that either got downgraded to status initialized or their rights changed in this syncWallets call.
+ *
+ */
+export type SyncWalletsResultUpdated = Wallet[]
+/**
+ *
+ * Either wallets added in this iteration that are disabled, or existing wallet that were updated to be disabled in this syncWallets call.
+ *
+ */
+export type SyncWalletsResultDisabled = Wallet[]
 /**
  *
  * Whether wallet sync is needed. Returns true if there are disabled wallets or parties on the ledger that aren't in the store.
  *
  */
 export type WalletSyncNeeded = boolean
+export type TxStatusSigned = 'signed'
+export interface SignResultSigned {
+    status: TxStatusSigned
+    signature: Signature
+    signedBy: SignedBy
+    partyId: PartyId
+    externalTxId?: ExternalTxId
+}
+export type TxStatusPending = 'pending'
+export interface SignResultPending {
+    status: TxStatusPending
+    partyId: PartyId
+    externalTxId: ExternalTxId
+}
+export type TxStatusRejected = 'rejected'
+export interface SignResultRejected {
+    status: TxStatusRejected
+    partyId: PartyId
+    externalTxId: ExternalTxId
+}
+export type TxStatusFailed = 'failed'
+export interface SignResultFailed {
+    status: TxStatusFailed
+    partyId: PartyId
+    externalTxId: ExternalTxId
+}
 /**
  *
  * The access token for the session.
@@ -276,6 +302,7 @@ export type AccessToken = string
  *
  */
 export type Status = string
+export type UserLevelRight = any
 /**
  *
  * Structure representing the connected network session
@@ -288,8 +315,39 @@ export interface Session {
     accessToken: AccessToken
     status: Status
     reason?: Reason
+    rights: Rights
 }
 export type Sessions = Session[]
+/**
+ *
+ * The unique identifier of the command associated with the transaction.
+ *
+ */
+export type CommandId = string
+/**
+ *
+ * The timestamp when the transaction was created.
+ *
+ */
+export type CreatedAt = string
+/**
+ *
+ * The timestamp when the transaction was signed.
+ *
+ */
+export type SignedAt = string
+/**
+ *
+ * The transaction data corresponding to the command ID.
+ *
+ */
+export type PreparedTransaction = string
+/**
+ *
+ * The hash of the prepared transaction.
+ *
+ */
+export type PreparedTransactionHash = string
 /**
  *
  * Optional payload associated with the transaction.
@@ -303,71 +361,77 @@ export type Payload = string
  */
 export type Origin = string
 export interface Transaction {
+    id: TransactionId
     commandId: CommandId
     status: Status
+    createdAt?: CreatedAt
+    signedAt?: SignedAt
     preparedTransaction: PreparedTransaction
     preparedTransactionHash: PreparedTransactionHash
     payload?: Payload
     origin?: Origin
-    [k: string]: any
+    externalTxId?: ExternalTxId
 }
 export type Transactions = Transaction[]
+/**
+ *
+ * The unique identifier of the current user.
+ *
+ */
+export type UserIdentifier = string
+/**
+ *
+ * Whether the current user is an admin.
+ *
+ */
+export type IsAdminFlag = boolean
 export interface AddNetworkParams {
     network: Network
-    [k: string]: any
 }
 export interface RemoveNetworkParams {
     networkName: NetworkName
-    [k: string]: any
 }
 export interface AddIdpParams {
     idp: Idp
-    [k: string]: any
 }
 export interface RemoveIdpParams {
     identityProviderId: IdentityProviderId
-    [k: string]: any
 }
 export interface CreateWalletParams {
     primary?: Primary
     partyHint: PartyHint
     signingProviderId: SigningProviderId
-    signingProviderContext?: SigningProviderContext
-    [k: string]: any
+}
+export interface AllocatePartyForWalletParams {
+    partyId: PartyId
 }
 export interface SetPrimaryWalletParams {
     partyId: PartyId
-    [k: string]: any
 }
 export interface RemoveWalletParams {
     partyId: PartyId
-    [k: string]: any
 }
 export interface ListWalletsParams {
     filter?: WalletFilter
-    [k: string]: any
 }
 export interface SignParams {
-    preparedTransaction: PreparedTransaction
-    preparedTransactionHash: PreparedTransactionHash
-    commandId: CommandId
+    transactionId: TransactionId
     partyId: PartyId
-    [k: string]: any
 }
 export interface ExecuteParams {
     signature: Signature
     partyId: PartyId
-    commandId: CommandId
+    transactionId: TransactionId
     signedBy: SignedBy
-    [k: string]: any
 }
 export interface AddSessionParams {
     networkId: NetworkId
-    [k: string]: any
 }
 export interface GetTransactionParams {
-    commandId: CommandId
-    [k: string]: any
+    transactionId: TransactionId
+}
+export interface DeleteTransactionParams {
+    transactionId: TransactionId
 }
 /**
  *
@@ -377,15 +441,15 @@ export interface GetTransactionParams {
 export type Null = null
 export interface ListNetworksResult {
     networks: Networks
-    [k: string]: any
 }
 export interface ListIdpsResult {
     idps: Idps
-    [k: string]: any
 }
 export interface CreateWalletResult {
     wallet: Wallet
-    [k: string]: any
+}
+export interface AllocatePartyForWalletResult {
+    wallet: Wallet
 }
 export interface RemovePartyResult {
     [key: string]: any
@@ -398,24 +462,22 @@ export interface RemovePartyResult {
 export type ListWalletsResult = Wallet[]
 /**
  *
- * Added and removed wallets as a result of the sync.
+ * Added, updated  and disabled wallets as a result of the sync.
  *
  */
 export interface SyncWalletsResult {
-    added: Added
-    removed: Removed
-    [k: string]: any
+    added: SyncWalletsResultAdded
+    updated: SyncWalletsResultUpdated
+    disabled: SyncWalletsResultDisabled
 }
 export interface IsWalletSyncNeededResult {
     walletSyncNeeded: WalletSyncNeeded
-    [k: string]: any
 }
-export interface SignResult {
-    signature: Signature
-    partyId: PartyId
-    signedBy: SignedBy
-    [k: string]: any
-}
+export type SignResult =
+    | SignResultSigned
+    | SignResultPending
+    | SignResultRejected
+    | SignResultFailed
 export interface ExecuteResult {
     [key: string]: any
 }
@@ -431,23 +493,29 @@ export interface AddSessionResult {
     accessToken: AccessToken
     status: Status
     reason?: Reason
+    rights: Rights
 }
 export interface ListSessionsResult {
     sessions: Sessions
-    [k: string]: any
 }
 export interface GetTransactionResult {
+    id: TransactionId
     commandId: CommandId
     status: Status
+    createdAt?: CreatedAt
+    signedAt?: SignedAt
     preparedTransaction: PreparedTransaction
     preparedTransactionHash: PreparedTransactionHash
     payload?: Payload
     origin?: Origin
-    [k: string]: any
+    externalTxId?: ExternalTxId
 }
 export interface ListTransactionsResult {
     transactions: Transactions
-    [k: string]: any
+}
+export interface GetUserResult {
+    userId: UserIdentifier
+    isAdmin: IsAdminFlag
 }
 /**
  *
@@ -464,6 +532,9 @@ export type ListIdps = () => Promise<ListIdpsResult>
 export type CreateWallet = (
     params: CreateWalletParams
 ) => Promise<CreateWalletResult>
+export type AllocatePartyForWallet = (
+    params: AllocatePartyForWalletParams
+) => Promise<AllocatePartyForWalletResult>
 export type SetPrimaryWallet = (params: SetPrimaryWalletParams) => Promise<Null>
 export type RemoveWallet = (
     params: RemoveWalletParams
@@ -482,3 +553,7 @@ export type GetTransaction = (
     params: GetTransactionParams
 ) => Promise<GetTransactionResult>
 export type ListTransactions = () => Promise<ListTransactionsResult>
+export type DeleteTransaction = (
+    params: DeleteTransactionParams
+) => Promise<Null>
+export type GetUser = () => Promise<GetUserResult>

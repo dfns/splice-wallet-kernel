@@ -8,6 +8,9 @@ import {
     Session,
     Network,
     WalletStatus,
+    UpdateWallet,
+    PartyLevelRight,
+    UserLevelRight,
 } from '@canton-network/core-wallet-store'
 
 interface MigrationTable {
@@ -35,6 +38,11 @@ interface NetworkTable {
     adminAuth: string | undefined // json stringified
 }
 
+/**
+ * Wallet table schema
+ * Primary key on (partyId, networkId, userId)
+ * Unique constraint on (networkId, userId) for primary wallet per network per user
+ */
 interface WalletTable {
     primary: number
     partyId: string
@@ -44,16 +52,39 @@ interface WalletTable {
     networkId: string
     signingProviderId: string
     userId: UserId
-    externalTxId?: string
-    topologyTransactions?: string
-    status?: string
+    externalTxId: string | null
+    topologyTransactions: string | null
+    status: string | null
     disabled: number
-    reason?: string
+    reason: string | null
+}
+interface UpdateWalletProperties {
+    primary?: number
+    externalTxId?: string | null
+    topologyTransactions?: string | null
+    status?: string | null
+    disabled?: number
+    reason?: string | null
+}
+
+interface UserPartyRightTable {
+    userId: UserId
+    networkId: string
+    partyId: string
+    right: PartyLevelRight
+}
+
+interface UserRightTable {
+    userId: UserId
+    networkId: string
+    right: UserLevelRight
 }
 
 interface TransactionTable {
+    id: string
     status: string
     commandId: string
+    networkId: string
     preparedTransaction: string
     preparedTransactionHash: string
     payload: string | undefined
@@ -61,6 +92,7 @@ interface TransactionTable {
     userId: UserId
     createdAt: string | null
     signedAt: string | null
+    externalTxId: string | null
 }
 
 interface SessionTable extends Session {
@@ -73,6 +105,8 @@ export interface DB {
     idps: IdpTable
     networks: NetworkTable
     wallets: WalletTable
+    userPartyRights: UserPartyRightTable
+    userRights: UserRightTable
     transactions: TransactionTable
     sessions: SessionTable
 }
@@ -162,25 +196,51 @@ export const fromNetwork = (
 }
 
 export const fromWallet = (wallet: Wallet, userId: UserId): WalletTable => {
+    const { externalTxId, topologyTransactions, rights, ...rest } = wallet
+    void rights
     return {
-        ...wallet,
+        ...rest,
         primary: wallet.primary ? 1 : 0,
         userId: userId,
         disabled: wallet.disabled !== undefined && wallet.disabled ? 1 : 0,
-        ...(wallet.disabled === true &&
-            wallet.reason !== undefined && { reason: wallet.reason }),
+        reason: wallet.reason ?? null,
+        externalTxId: externalTxId && externalTxId !== '' ? externalTxId : null,
+        topologyTransactions:
+            topologyTransactions && topologyTransactions !== ''
+                ? topologyTransactions
+                : null,
     }
 }
 
-export const toWalletStatus = (status?: string): WalletStatus => {
+// only update fields that are explicitly provided to prevent data loss
+export const toWalletUpdateProperties = (
+    params: UpdateWallet
+): UpdateWalletProperties => {
+    const {
+        status,
+        externalTxId,
+        topologyTransactions,
+        disabled,
+        reason,
+        primary,
+    } = params
+    return {
+        ...(status !== undefined && { status }),
+        ...(externalTxId !== undefined && { externalTxId }),
+        ...(topologyTransactions !== undefined && { topologyTransactions }),
+        ...(primary !== undefined && { primary: primary ? 1 : 0 }),
+        ...(disabled !== undefined && { disabled: disabled ? 1 : 0 }),
+        ...(reason !== undefined && { reason }),
+    }
+}
+
+export const toWalletStatus = (status?: string | null): WalletStatus => {
     if (status === 'allocated') return 'allocated'
+    if (status === 'removed') return 'removed'
     return 'initialized'
 }
 
 export const toWallet = (table: WalletTable): Wallet => {
-    if (table.disabled === 1 && table.reason === undefined) {
-        throw new Error(`Missing wallet disabled reason: ${table.partyId}`)
-    }
     return {
         primary: Boolean(table.primary),
         status: toWalletStatus(table.status),
@@ -191,25 +251,41 @@ export const toWallet = (table: WalletTable): Wallet => {
         networkId: table.networkId,
         signingProviderId: table.signingProviderId,
         disabled: table.disabled === 1,
-        ...(table.externalTxId !== undefined && {
+        ...(table.externalTxId !== null && {
             externalTxId: table.externalTxId,
         }),
-        ...(table.topologyTransactions !== undefined && {
+        ...(table.topologyTransactions !== null && {
             topologyTransactions: table.topologyTransactions,
         }),
-        ...(table.disabled === 1 &&
-            table.reason !== undefined && {
-                reason: table.reason,
-            }),
+        ...(table.reason !== null && {
+            reason: table.reason,
+        }),
+        rights: [],
     }
+}
+
+export const fromPartyRight = (right: string): PartyLevelRight | undefined => {
+    if (Object.values(PartyLevelRight).includes(right as PartyLevelRight)) {
+        return right as PartyLevelRight
+    }
+    return undefined
+}
+
+export const fromUserRight = (right: string): UserLevelRight | undefined => {
+    if (Object.values(UserLevelRight).includes(right as UserLevelRight)) {
+        return right as UserLevelRight
+    }
+    return undefined
 }
 
 export const fromTransaction = (
     transaction: Transaction,
-    userId: UserId
+    userId: UserId,
+    networkId: string
 ): TransactionTable => {
     return {
         ...transaction,
+        networkId,
         payload: transaction.payload
             ? JSON.stringify(transaction.payload)
             : undefined,
@@ -217,11 +293,13 @@ export const fromTransaction = (
         userId: userId,
         createdAt: transaction.createdAt?.toISOString() || null,
         signedAt: transaction.signedAt?.toISOString() || null,
+        externalTxId: transaction.externalTxId ?? null,
     }
 }
 
 export const toTransaction = (table: TransactionTable): Transaction => {
     const result: Transaction = {
+        id: table.id,
         commandId: table.commandId,
         status: table.status as 'pending' | 'signed' | 'executed' | 'failed',
         preparedTransaction: table.preparedTransaction,
@@ -236,6 +314,10 @@ export const toTransaction = (table: TransactionTable): Transaction => {
 
     if (table.signedAt) {
         result.signedAt = new Date(table.signedAt)
+    }
+
+    if (table.externalTxId) {
+        result.externalTxId = table.externalTxId
     }
 
     return result

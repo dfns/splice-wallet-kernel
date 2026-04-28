@@ -6,28 +6,25 @@ import {
     defaultRetryableOptions,
 } from '@canton-network/core-ledger-client'
 import { AuthContext } from '@canton-network/core-wallet-auth'
-import { Store, Wallet } from '@canton-network/core-wallet-store'
+import {
+    Store,
+    Wallet,
+    PartyLevelRight,
+    UserLevelRight,
+} from '@canton-network/core-wallet-store'
 import {
     SigningDriverInterface,
     SigningProvider,
 } from '@canton-network/core-signing-lib'
 import { Logger } from 'pino'
 import { PartyAllocationService } from './party-allocation-service.js'
-
-export type WalletSyncReport = {
-    added: Wallet[]
-    removed: Wallet[]
-}
-
-export const WALLET_DISABLED_REASON = {
-    NO_SIGNING_PROVIDER_MATCHED: 'no signing provider matched',
-}
+import { SyncWalletsResult } from '../user-api/rpc-gen/typings.js'
+import { WALLET_DISABLED_REASON } from '@canton-network/core-types'
 
 export class WalletSyncService {
     constructor(
         private store: Store,
         private ledgerClient: LedgerClient,
-        private adminLedgerClient: LedgerClient,
         private authContext: AuthContext,
         private logger: Logger,
         private signingDrivers: Partial<
@@ -35,6 +32,18 @@ export class WalletSyncService {
         > = {},
         private partyAllocator: PartyAllocationService
     ) {}
+
+    private static readonly EMPTY_RIGHTS: PartyLevelRight[] = []
+
+    private sameRights(
+        left?: PartyLevelRight[],
+        right: PartyLevelRight[] = WalletSyncService.EMPTY_RIGHTS
+    ): boolean {
+        const leftSet = new Set(left ?? WalletSyncService.EMPTY_RIGHTS)
+        const rightSet = new Set(right)
+        if (leftSet.size !== rightSet.size) return false
+        return [...leftSet].every((item) => rightSet.has(item))
+    }
 
     async run(timeoutMs: number): Promise<void> {
         this.logger.info(
@@ -46,7 +55,28 @@ export class WalletSyncService {
         }
     }
 
-    protected async resolveSigningProvider(namespace: string): Promise<
+    private async getParticipantNamespace(): Promise<string> {
+        const { participantId } = await this.ledgerClient.getWithRetry(
+            '/v2/parties/participant-id',
+            defaultRetryableOptions
+        )
+        // Extract the namespace part from participantId
+        // Format is hint::namespace
+        const [, extractedNamespace] = participantId.split('::')
+        if (extractedNamespace) {
+            return extractedNamespace
+        } else {
+            throw new Error(
+                `Invalid participantId format: expected "hint::namespace", got "${participantId}"`
+            )
+        }
+    }
+
+    // Protected for tests
+    protected async resolveSigningProvider(
+        partyNamespace: string,
+        participantNamespace: string
+    ): Promise<
         | {
               signingProviderId: SigningProvider.PARTICIPANT
               matched: boolean
@@ -61,31 +91,10 @@ export class WalletSyncService {
           }
     > {
         try {
-            // Check if namespace matches participant namespace first
-            // (participant parties have namespace === participantId's namespace)
-            let participantNamespace: string | undefined
-            try {
-                const { participantId } =
-                    await this.adminLedgerClient.getWithRetry(
-                        '/v2/parties/participant-id',
-                        defaultRetryableOptions
-                    )
-                // Extract the namespace part from participantId
-                // Format is hint::namespace
-                const [, extractedNamespace] = participantId.split('::')
-                if (extractedNamespace) {
-                    participantNamespace = extractedNamespace
-                } else {
-                    this.logger.warn(
-                        { participantId },
-                        `Invalid participantId format: expected "hint::namespace", got "${participantId}"`
-                    )
-                }
-            } catch (err) {
-                this.logger.warn({ err }, 'Failed to get participant namespace')
-            }
-
-            if (participantNamespace && namespace === participantNamespace) {
+            if (
+                participantNamespace &&
+                partyNamespace === participantNamespace
+            ) {
                 return {
                     signingProviderId: SigningProvider.PARTICIPANT,
                     matched: true,
@@ -110,7 +119,7 @@ export class WalletSyncService {
 
                     // In case of error getKeys resolve Promise but with error object
                     if ('error' in result) {
-                        this.logger.debug(
+                        this.logger.warn(
                             {
                                 providerId,
                                 error: result.error,
@@ -134,10 +143,10 @@ export class WalletSyncService {
                                 this.partyAllocator.createFingerprintFromKey(
                                     normalizedKey
                                 )
-                            if (keyNamespace === namespace) {
-                                this.logger.debug(
+                            if (keyNamespace === partyNamespace) {
+                                this.logger.info(
                                     {
-                                        namespace,
+                                        namespace: partyNamespace,
                                         providerId,
                                         keyId: key.id,
                                         publicKey: key.publicKey,
@@ -154,7 +163,7 @@ export class WalletSyncService {
                         }
                     }
                 } catch (err) {
-                    this.logger.debug(
+                    this.logger.error(
                         { err, providerId },
                         'Error getting keys from signing provider'
                     )
@@ -164,7 +173,7 @@ export class WalletSyncService {
 
             // No match found - use participant as default provider
             this.logger.warn(
-                { namespace },
+                { namespace: partyNamespace },
                 'No signing provider match found for namespace, using participant as default and marking wallet as unmatched (disabled)'
             )
             return {
@@ -173,7 +182,7 @@ export class WalletSyncService {
             }
         } catch (err) {
             this.logger.error(
-                { err, namespace },
+                { err, namespace: partyNamespace },
                 'Error resolving signing provider, using participant as default and marking wallet as unmatched (disabled)'
             )
             // On error, use participant as default but mark as unmatched
@@ -184,7 +193,10 @@ export class WalletSyncService {
         }
     }
 
-    private async getPartiesRightsMap(): Promise<Map<string, string>> {
+    private async getRightsSnapshot(): Promise<{
+        rightsByParty: Map<string, PartyLevelRight[]>
+        rightsByUser: Map<string, Set<UserLevelRight>>
+    }> {
         const rights = await this.ledgerClient.getWithRetry(
             '/v2/users/{user-id}/rights',
             defaultRetryableOptions,
@@ -195,44 +207,61 @@ export class WalletSyncService {
             }
         )
 
-        const partiesWithRights = new Map<string, string>()
+        const rightsByParty = new Map<string, Set<PartyLevelRight>>()
+        const rightsByUser = new Map<string, Set<UserLevelRight>>([
+            [this.authContext.userId, new Set<UserLevelRight>()],
+        ])
+
+        const getOrCreateRights = (party: string): Set<PartyLevelRight> => {
+            const existing = rightsByParty.get(party)
+            if (existing) return existing
+            const created = new Set<PartyLevelRight>()
+            rightsByParty.set(party, created)
+            return created
+        }
 
         rights.rights?.forEach((right) => {
-            let party: string | undefined
-            let rightType: string | undefined
-            if ('CanActAs' in right.kind) {
-                party = right.kind.CanActAs.value.party
-                rightType = 'CanActAs'
-            } else if ('CanExecuteAs' in right.kind) {
-                party = right.kind.CanExecuteAs.value.party
-                rightType = 'CanExecuteAs'
-            } else if ('CanReadAs' in right.kind) {
-                party = right.kind.CanReadAs.value.party
-                rightType = 'CanReadAs'
+            const kind = right.kind
+            if (!kind) return
+
+            if ('CanActAs' in kind) {
+                const party = kind.CanActAs.value.party
+                getOrCreateRights(party).add(PartyLevelRight.CanActAs)
+            } else if ('CanExecuteAs' in kind) {
+                const party = kind.CanExecuteAs.value.party
+                getOrCreateRights(party).add(PartyLevelRight.CanExecuteAs)
+            } else if ('CanReadAs' in kind) {
+                const party = kind.CanReadAs.value.party
+                getOrCreateRights(party).add(PartyLevelRight.CanReadAs)
+            } else if ('CanReadAsAnyParty' in kind) {
+                rightsByUser
+                    .get(this.authContext.userId)
+                    ?.add(UserLevelRight.CanReadAsAnyParty)
+            } else if ('CanExecuteAsAnyParty' in kind) {
+                rightsByUser
+                    .get(this.authContext.userId)
+                    ?.add(UserLevelRight.CanExecuteAsAnyParty)
             }
-            if (
-                party !== undefined &&
-                rightType !== undefined &&
-                !partiesWithRights.has(party)
-            )
-                partiesWithRights.set(party, rightType)
         })
 
-        return partiesWithRights
+        return {
+            rightsByParty: new Map(
+                [...rightsByParty.entries()].map(([party, rights]) => [
+                    party,
+                    [...rights],
+                ])
+            ),
+            rightsByUser,
+        }
     }
 
     async isWalletSyncNeeded(): Promise<boolean> {
         try {
             const network = await this.store.getCurrentNetwork()
-
             const existingWallets = await this.store.getWallets()
-
-            const hasDisabledWallets = existingWallets.some((w) => w.disabled)
-            if (hasDisabledWallets) {
-                return true
-            }
-
-            const partiesWithRights = await this.getPartiesRightsMap()
+            const { rightsByParty, rightsByUser } =
+                await this.getRightsSnapshot()
+            const partiesWithRights = Array.from(rightsByParty.keys())
 
             // Treat disabled wallets as if they don't exist, so they can be re-synced
             const enabledWallets = existingWallets.filter((w) => !w.disabled)
@@ -242,9 +271,42 @@ export class WalletSyncService {
             )
 
             // Check if there are parties on ledger that aren't in store for this network
-            return Array.from(partiesWithRights.keys()).some(
+            const hasNewPartiesOnLedger = partiesWithRights.some(
                 (party) =>
                     !existingPartyNetworkPairs.has(`${party}:${network.id}`)
+            )
+            if (hasNewPartiesOnLedger) return true
+
+            // Check if there are allocated wallets in store whose party is not on ledger
+            const hasWalletsWithoutParty = enabledWallets.some(
+                (wallet) =>
+                    wallet.status === 'allocated' &&
+                    !partiesWithRights.includes(wallet.partyId)
+            )
+
+            const hasChangedRights = enabledWallets.some((wallet) => {
+                if (wallet.status !== 'allocated') return false
+                const nextRights = rightsByParty.get(wallet.partyId)
+                if (!nextRights) return false
+                return !this.sameRights(wallet.rights, nextRights)
+            })
+
+            const currentUserRights = await this.store.getUserRights(network.id)
+            const nextUserRights = [
+                ...(rightsByUser.get(this.authContext.userId) ??
+                    new Set<UserLevelRight>()),
+            ]
+            const hasChangedUserRights =
+                new Set(currentUserRights).size !==
+                    new Set(nextUserRights).size ||
+                currentUserRights.some(
+                    (right) => !nextUserRights.includes(right)
+                )
+
+            return (
+                hasWalletsWithoutParty ||
+                hasChangedRights ||
+                hasChangedUserRights
             )
         } catch (err) {
             this.logger.error({ err }, 'Error checking if sync is needed')
@@ -252,151 +314,265 @@ export class WalletSyncService {
             throw err
         }
     }
-    async syncWallets(): Promise<WalletSyncReport> {
+
+    // Participant wallets: disable when party not on ledger (participant node reset, namespace changed).
+    // Other wallets: mark as initialized so user can re-allocate (e.g. after external signing).
+    private async handleWalletsWithoutParty(
+        allocatedWallets: Wallet[],
+        partiesWithRights: Set<string>
+    ): Promise<{
+        updatedToInitialized: Wallet[]
+        updatedToDisabled: Wallet[]
+    }> {
+        const walletsWithoutParty = allocatedWallets.filter(
+            (wallet) => !partiesWithRights.has(wallet.partyId)
+        )
+        const updatedToInitialized: Wallet[] = []
+        const updatedToDisabled: Wallet[] = []
+
+        for (const wallet of walletsWithoutParty) {
+            if (wallet.status !== 'allocated' || wallet.disabled) continue
+
+            try {
+                if (wallet.signingProviderId === SigningProvider.PARTICIPANT) {
+                    this.logger.warn(
+                        {
+                            partyId: wallet.partyId,
+                            signingProviderId: wallet.signingProviderId,
+                        },
+                        'Participant wallet party not on ledger, disabling (participant namespace changed)'
+                    )
+                    const disabledWallet: Wallet = {
+                        ...wallet,
+                        disabled: true,
+                        reason: WALLET_DISABLED_REASON.PARTICIPANT_NAMESPACE_CHANGED,
+                        ...(wallet.primary && { primary: false }),
+                    }
+                    await this.store.updateWallet({
+                        partyId: wallet.partyId,
+                        networkId: wallet.networkId,
+                        disabled: true,
+                        reason: WALLET_DISABLED_REASON.PARTICIPANT_NAMESPACE_CHANGED,
+                        ...(wallet.primary && { primary: false }),
+                    })
+                    updatedToDisabled.push(disabledWallet)
+                } else {
+                    this.logger.info(
+                        {
+                            partyId: wallet.partyId,
+                            signingProviderId: wallet.signingProviderId,
+                        },
+                        'Party not found on participant, marking wallet as initialized'
+                    )
+                    await this.store.updateWallet({
+                        partyId: wallet.partyId,
+                        networkId: wallet.networkId,
+                        status: 'initialized',
+                        ...(wallet.primary && { primary: false }),
+                    })
+                    const reinitialized: Wallet = {
+                        ...wallet,
+                        status: 'initialized',
+                        ...(wallet.primary && { primary: false }),
+                    }
+                    updatedToInitialized.push(reinitialized)
+                }
+            } catch (err) {
+                this.logger.warn(
+                    { err, partyId: wallet.partyId },
+                    'Failed to update wallet'
+                )
+            }
+        }
+
+        return {
+            updatedToInitialized,
+            updatedToDisabled,
+        }
+    }
+
+    // Creates wallets for parties user has rights to
+    private async handlePartiesWithoutWallet(
+        newParties: string[],
+        networkId: string,
+        rightsByParty: Map<string, PartyLevelRight[]>,
+        participantNamespace: string
+    ): Promise<Wallet[]> {
+        return await Promise.all(
+            newParties.map(async (partyId) => {
+                const [hint, namespace] = partyId.split('::')
+
+                const resolvedSigningProvider =
+                    await this.resolveSigningProvider(
+                        namespace,
+                        participantNamespace
+                    )
+
+                const isMatched = resolvedSigningProvider.matched
+
+                const walletPublicKey =
+                    resolvedSigningProvider.signingProviderId ===
+                    SigningProvider.PARTICIPANT
+                        ? namespace
+                        : 'publicKey' in resolvedSigningProvider
+                          ? resolvedSigningProvider.publicKey
+                          : namespace
+
+                const wallet: Wallet = {
+                    primary: false,
+                    status: 'allocated',
+                    partyId,
+                    hint,
+                    publicKey: walletPublicKey,
+                    namespace,
+                    networkId,
+                    signingProviderId:
+                        resolvedSigningProvider.signingProviderId,
+                    disabled: !isMatched,
+                    rights:
+                        rightsByParty.get(partyId) ??
+                        WalletSyncService.EMPTY_RIGHTS,
+                    ...(!isMatched && {
+                        reason: WALLET_DISABLED_REASON.NO_SIGNING_PROVIDER_MATCHED,
+                    }),
+                }
+
+                this.logger.info({ ...wallet }, 'Wallet sync result')
+                await this.store.addWallet(wallet)
+                return wallet
+            })
+        )
+    }
+
+    private async handleRightsUpdates(
+        existingAllocatedWallets: Wallet[],
+        rightsByParty: Map<string, PartyLevelRight[]>
+    ): Promise<Wallet[]> {
+        const updatedWallets: Wallet[] = []
+
+        for (const wallet of existingAllocatedWallets) {
+            const nextRights = rightsByParty.get(wallet.partyId)
+            if (!nextRights) continue
+            if (this.sameRights(wallet.rights, nextRights)) continue
+
+            await this.store.updateWallet({
+                partyId: wallet.partyId,
+                networkId: wallet.networkId,
+                rights: nextRights,
+            })
+            updatedWallets.push({ ...wallet, rights: nextRights })
+        }
+
+        return updatedWallets
+    }
+
+    async syncWallets(): Promise<SyncWalletsResult> {
         this.logger.info('Starting wallet sync...')
         try {
+            const participantNamespace = await this.getParticipantNamespace()
             const network = await this.store.getCurrentNetwork()
             this.logger.info(network, 'Current network')
 
-            const partiesWithRights = await this.getPartiesRightsMap()
+            const { rightsByParty, rightsByUser } =
+                await this.getRightsSnapshot()
+            const partiesWithRights = Array.from(rightsByParty.keys())
 
-            // Add new Wallets given the found parties
-            // Only check wallets in the current network
+            await this.store.setUserRights(network.id, [
+                ...(rightsByUser.get(this.authContext.userId) ??
+                    new Set<UserLevelRight>()),
+            ])
+
             const existingWallets = await this.store.getWallets()
             this.logger.info(existingWallets, 'Existing wallets')
-            // Treat disabled wallets as if they don't exist, so they can be re-synced
-            const enabledWallets = existingWallets.filter((w) => !w.disabled)
-            // Track by (partyId, networkId) combination
-            const existingPartyNetworkToSigningProvider = new Map(
-                enabledWallets.map((w) => [
-                    `${w.partyId}:${w.networkId}`,
-                    w.signingProviderId,
-                ])
+            // Skips wallets for which we didn't allocate a party
+            const existingAllocatedWallets = existingWallets.filter(
+                (w) => w.status === 'allocated'
+            )
+            const existingPartiesOnNetwork = new Set(
+                existingAllocatedWallets.map(
+                    (w) => `${w.partyId}:${w.networkId}`
+                )
             )
 
-            // Track disabled wallets by (partyId, networkId) combination
-            const disabledPartyNetworkPairs = new Set(
-                existingWallets
-                    .filter((w) => w.disabled)
-                    .map((w) => `${w.partyId}:${w.networkId}`)
-            )
-
-            // Resolve signing providers for all new parties
-            // Check if (partyId, networkId) combination already exists
-            const newParties = Array.from(partiesWithRights.keys()).filter(
+            const newParties = partiesWithRights.filter(
                 (party) =>
-                    !existingPartyNetworkToSigningProvider.has(
-                        `${party}:${network.id}`
-                    )
+                    !existingPartiesOnNetwork.has(`${party}:${network.id}`)
                 // todo: filter on idp id
             )
 
-            this.logger.info(
-                { newParties },
-                'Found new parties to sync with Wallet Gateway'
-            )
-
-            const newParticipantWallets: Wallet[] = await Promise.all(
-                newParties.map(async (party) => {
-                    const [hint, namespace] = party.split('::')
-
-                    const resolvedSigningProvider =
-                        await this.resolveSigningProvider(namespace)
-
-                    // resolvedSigningProvider is never null (participant is default)
-                    const isMatched = resolvedSigningProvider.matched
-
-                    // Namespace is saved as public key in case of participant
-                    const walletPublicKey =
-                        resolvedSigningProvider.signingProviderId ===
-                        SigningProvider.PARTICIPANT
-                            ? namespace
-                            : 'publicKey' in resolvedSigningProvider
-                              ? resolvedSigningProvider.publicKey
-                              : namespace
-
-                    const wallet: Wallet = {
-                        primary: false,
-                        status: 'allocated',
-                        partyId: party,
-                        hint: hint,
-                        publicKey: walletPublicKey,
-                        namespace: namespace,
-                        networkId: network.id,
-                        signingProviderId:
-                            resolvedSigningProvider.signingProviderId,
-                        disabled: !isMatched,
-                        ...(!isMatched && {
-                            reason: WALLET_DISABLED_REASON.NO_SIGNING_PROVIDER_MATCHED,
-                        }),
-                    }
-
-                    this.logger.info(
-                        {
-                            ...wallet,
-                        },
-                        'Wallet sync result'
-                    )
-
-                    return wallet
-                })
-            )
-
-            // Remove disabled wallets that are being re-synced before adding them back
-            // Filter by (partyId, networkId) combination
-            await Promise.all(
-                newParticipantWallets
-                    .filter((wallet) =>
-                        disabledPartyNetworkPairs.has(
-                            `${wallet.partyId}:${wallet.networkId}`
-                        )
-                    )
-                    .map((wallet) => {
-                        this.logger.info(
-                            {
-                                partyId: wallet.partyId,
-                                networkId: wallet.networkId,
-                            },
-                            'Removing disabled wallet for re-sync'
-                        )
-                        return this.store.removeWallet(wallet.partyId)
-                    })
-            )
-
-            await Promise.all(
-                newParticipantWallets.map((wallet) =>
-                    this.store.addWallet(wallet)
+            const { updatedToInitialized, updatedToDisabled } =
+                await this.handleWalletsWithoutParty(
+                    existingAllocatedWallets,
+                    new Set(partiesWithRights)
                 )
+
+            const rightsUpdatedWallets = await this.handleRightsUpdates(
+                existingAllocatedWallets,
+                rightsByParty
             )
-            this.logger.info({ newParticipantWallets }, 'Created new wallets')
+
             this.logger.info(
                 {
-                    totalProcessed: newParties.length,
-                    added: newParticipantWallets.length,
-                    disabled: newParticipantWallets.filter((w) => w.disabled)
-                        .length,
+                    newParties,
+                    updatedToInitialized: updatedToInitialized.map(
+                        (w) => w.partyId
+                    ),
+                    updatedToDisabled: updatedToDisabled.map((w) => w.partyId),
                 },
-                'Wallet sync summary'
+                'Wallets without parties'
             )
 
-            // Set primary wallet if none exists in current network
+            const newParticipantWallets = await this.handlePartiesWithoutWallet(
+                newParties,
+                network.id,
+                rightsByParty,
+                participantNamespace
+            )
+
+            // Set primary wallet if none exists, or if primary is on an initialized wallet
             const networkWallets = await this.store.getWallets()
-            const hasPrimary = networkWallets.some((w) => w.primary)
-            if (!hasPrimary && networkWallets.length > 0) {
-                this.store.setPrimaryWallet(networkWallets[0].partyId)
+            const primaryWallet = networkWallets.find((w) => w.primary)
+            const allocatedWallets = networkWallets.filter(
+                (w) => w.status === 'allocated' && !w.disabled
+            )
+            const needsPrimaryReset =
+                primaryWallet?.status === 'initialized' ||
+                (!primaryWallet && allocatedWallets.length > 0)
+            if (needsPrimaryReset && allocatedWallets.length > 0) {
+                await this.store.setPrimaryWallet(allocatedWallets[0].partyId)
                 this.logger.info(
-                    `Set ${networkWallets[0].partyId} as primary wallet in network ${network.id}`
+                    `Set ${allocatedWallets[0].partyId} as primary wallet in network ${network.id}`
                 )
             }
 
-            this.logger.debug(
-                { wallets: newParticipantWallets },
+            const newWallets = newParticipantWallets
+            const updatedRaw = [
+                ...updatedToInitialized,
+                ...rightsUpdatedWallets,
+            ]
+
+            const added = newWallets.filter((wallet) => !wallet.disabled)
+            const updated = updatedRaw.filter((wallet) => !wallet.disabled)
+            const disabled = [
+                ...newWallets.filter((wallet) => wallet.disabled),
+                ...updatedRaw.filter((wallet) => wallet.disabled),
+                ...updatedToDisabled,
+            ]
+
+            this.logger.info(
+                {
+                    added,
+                    updated,
+                    disabled,
+                },
                 'Wallet sync completed.'
             )
+
             return {
-                added: newParticipantWallets,
-                removed: [],
-            } as WalletSyncReport
+                added,
+                updated,
+                disabled,
+            }
         } catch (err) {
             this.logger.error({ err }, 'Wallet sync failed.')
             throw err
